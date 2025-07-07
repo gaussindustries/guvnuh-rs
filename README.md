@@ -4,13 +4,13 @@ A laboratory‑scale governor that converts a 0.5 HP induction machine into a 
 
 ---
 
-## 1  Project Purpose
+##   Project Purpose
 
-> Deliver a fully documented, safety‑rated governor reference design that demonstrates the firmware, hardware, and workflow competencies required for entry‑level controls positions at utilities such as the Tennessee Valley Authority (TVA), Avista Utilities, and Schweitzer Engineering Laboratories.
+> Deliver a fully documented, safety‑rated governor reference design that demonstrates the firmware, hardware, and workflow competencies required for entry‑level controls positions/ firmware engineer.
 
 ---
 
-## 2  Functional Scope (Phase‑1)
+##   Functional Scope (Phase‑1)
 
 | ID     | Requirement                         | Target Value                     |
 | ------ | ----------------------------------- | -------------------------------- |
@@ -24,7 +24,7 @@ Phase‑2 will add EtherCAT/CiA‑402; Phase‑3 will replace the resistor load 
 
 ---
 
-## 3  Repository Structure
+##   Repository Structure
 
 ```
 ├── docs/                    ↳ Requirements → architecture → wiring → reference
@@ -40,7 +40,7 @@ Detailed diagrams are located in **`docs/10_architecture/`**; frozen schematics 
 
 ---
 
-## 4  Technology Stack
+##   Technology Stack
 
 | Layer             | Implementation                                       | Rationale                       |
 | ----------------- | ---------------------------------------------------- | ------------------------------- |
@@ -52,7 +52,7 @@ Detailed diagrams are located in **`docs/10_architecture/`**; frozen schematics 
 
 ---
 
-## 5  Milestone Road‑map ( 26 weeks )
+##   Milestone Road‑map ( 26 weeks )
 
 | Week | Deliverable                  | Competence Demonstrated             |
 | ---- | ---------------------------- | ----------------------------------- |
@@ -67,12 +67,12 @@ The full week‑by‑week table is maintained in **`docs/90_release_notes/roadma
 
 ---
 
-## 6  Build & Flash
+##   Build & Flash
 
 ```bash
 # clone and build
-$ git clone https://github.com/<user>/guvnuh.git
-$ cd guvnuh
+$ git clone https://github.com/gaussindustries/guvnuh-rs.git
+$ cd guvnuh-rs
 $ rustup target add thumbv7em-none-eabihf
 $ cargo build -p stm32_firmware --release
 
@@ -83,7 +83,7 @@ $ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
 
 ---
 
-## 7  Standards Referenced
+##   Standards Referenced
 
 * IEC 61800‑5‑2 (STO)   *hardware interlock*
 * IEC 61508 SIL‑2       *safety life‑cycle & diagnostics*
@@ -92,5 +92,4 @@ $ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
 
 ---
 
-© 2025 \<your name>  · MIT License
- 2025 \<my name> — MIT License
+© 2025 Juan Carlos Mancilla Jr  · MIT License
