@@ -20,7 +20,7 @@ mod app {
     #[shared]
     pub struct Shared {
         ld1: gpio::Pin<'B', 0, Output<PushPull>>,
-        ld2: gpio::Pin<'B', 7, Output<PushPull>>,
+        ld2: gpio::Pin<'E', 1, Output<PushPull>>,
         ld3: gpio::Pin<'B', 14, Output<PushPull>>,
     }
 
@@ -44,12 +44,14 @@ mod app {
 			.sysclk(200.MHz())               // choose your target
 			.freeze(pwrcfg, &dp.SYSCFG);     // <-- REQUIRED on H7
 
-		// GPIOB split requires the REC token from ccdr.peripheral
+		// GPIOB for LD1 (green) & LD3 (red)
 		let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
-
 		let mut ld1 = gpiob.pb0.into_push_pull_output();
-		let mut ld2 = gpiob.pb7.into_push_pull_output();
 		let mut ld3 = gpiob.pb14.into_push_pull_output();
+
+		// GPIOE for LD2 (orange)
+		let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
+		let mut ld2 = gpioe.pe1.into_push_pull_output();
 		ld1.set_low();
 		ld2.set_low();
 		ld3.set_low();
