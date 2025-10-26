@@ -74,11 +74,15 @@ The full week‑by‑week table is maintained in **`docs/90_release_notes/roadma
 $ git clone https://github.com/gaussindustries/guvnuh-rs.git
 $ cd guvnuh-rs
 $ rustup target add thumbv7em-none-eabihf
-$ cargo build -p stm32_firmware --release
+$ cargo build -p stm32_firmware --release --target thumbv7em-none-eabihf
 
-# program via ST‑LINK
-$ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
-          -c "program target/thumbv7em-none-eabihf/release/stm32_firmware.elf verify reset exit"
+# program via ST‑LINK (using opencd) [firmware/stm32/flash-stm32-opencd.sh]
+$  bash firmware/stm32/gdb_flash.sh
+```
+
+```
+# debug via GNU Debugger [firmware/stm32/gdb_flash.sh]
+$  bash firmware/stm32/gdb_flash.sh
 ```
 
 ---
