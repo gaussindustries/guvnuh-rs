@@ -21,3 +21,5 @@ target
 #.idea/
 *.backup
 /hardware/**/out_gerber/
+
+docs/40_firmware_design/personal_study_plan.md

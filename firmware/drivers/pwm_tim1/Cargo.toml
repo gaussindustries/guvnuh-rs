@@ -1,0 +1,12 @@
+[package]
+name = "pwm_tim1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+stm32h7xx-hal = { workspace = true }
+fugit = "0.3.7"
+
+[lib]
+name = "pwm_tim1"
+path = "src/lib.rs"

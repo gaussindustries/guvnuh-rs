@@ -1,0 +1,13 @@
+[package]
+name = "spi_dma_ads131"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+stm32h7xx-hal = { workspace = true }
+fugit = "0.3.7"
+heapless = "0.9.1"
+
+[lib]
+name = "spi_dma_ads131"
+path = "src/lib.rs"

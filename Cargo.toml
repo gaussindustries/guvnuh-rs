@@ -1,2 +1,27 @@
 [workspace]
-members = ["firmware/stm32","firmware/esp32"]
+members = [
+    "firmware/app",
+    "firmware/drivers/pwm_tim1",
+    #"firmware/drivers/spi_dma_ads131",
+    "firmware/esp32",
+    "firmware/kernels/freertos_rs",
+    "firmware/kernels/rtic_stub",
+    "firmware/stm32",
+]
+resolver = "2"
+
+[workspace.dependencies]
+cortex-m-rt = "0.7"
+stm32h7xx-hal = { version = "0.16", features = ["stm32h753", "rt", "defmt"] }
+defmt = "1.0.1"
+defmt-rtt = "1.1.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+
+

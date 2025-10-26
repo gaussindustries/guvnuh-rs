@@ -1,0 +1,14 @@
+[package]
+name = "rtic_stub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7.7"
+stm32h7xx-hal = { workspace = true }
+rtic = { version = "2.0", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.0", features = ["cortex-m-systick"] }
+
+[lib]
+name = "rtic_stub"
+path = "src/lib.rs"
