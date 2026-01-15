@@ -1,6 +1,6 @@
 [package]
 name = "stm32_firmware"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 
 [dependencies]
@@ -14,11 +14,16 @@ panic-probe = { version = "1", features = ["print-defmt"] }
 rtic = { version = "2.0", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "2.1.0", features = ["cortex-m-systick"] }
 
-[dependencies.pwm_tim1]
-path = "../drivers/pwm_tim1"
+shared ={ path = "../shared"}
+models = { path = "./models"}
 
-[dependencies.spi_dma_ads131]
-path = "../drivers/spi_dma_ads131"
+# [dependencies.pwm_tim1]
+# path = "../drivers/pwm_tim1"
+
+# [dependencies.spi_dma_ads131]
+# path = "../drivers/spi_dma_ads131"
+
+
 
 [package.metadata.cortex-m-rt]
 memory-x = true

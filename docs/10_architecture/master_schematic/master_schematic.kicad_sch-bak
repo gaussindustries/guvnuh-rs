@@ -3693,16 +3693,6 @@
 		)
 		(uuid "fde06e91-8e7f-499c-acae-24eb6d599011")
 	)
-	(label "ADC"
-		(at 209.55 125.73 0)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left bottom)
-		)
-		(uuid "06e35558-b195-491c-b97a-16da3739e828")
-	)
 	(rule_area
 		(polyline
 			(pts
@@ -5074,48 +5064,6 @@
 				(path "/161501ba-58a2-4e54-b00f-2c454c29b444"
 					(reference "U3")
 					(unit 1)
-				)
-			)
-		)
-	)
-	(sheet
-		(at 177.8 101.6)
-		(size 15.24 6.35)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(fields_autoplaced yes)
-		(stroke
-			(width 0.1524)
-			(type solid)
-		)
-		(fill
-			(color 0 0 0 0.0000)
-		)
-		(uuid "382fc563-bd2c-4f55-afa5-84da2a777f62")
-		(property "Sheetname" "States"
-			(at 177.8 100.8884 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left bottom)
-			)
-		)
-		(property "Sheetfile" "states.kicad_sch"
-			(at 177.8 108.5346 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left top)
-			)
-		)
-		(instances
-			(project "master_schematic"
-				(path "/161501ba-58a2-4e54-b00f-2c454c29b444"
-					(page "2")
 				)
 			)
 		)

@@ -38,12 +38,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -243,29 +237,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d758ba1b47b00caf47f24925c0074ecb20d6dfcffe7f6d53395c0465674841a"
 
 [[package]]
-name = "hash32"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
-name = "heapless"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1edcd5a338e64688fbdcb7531a846cfd3476a54784dcb918a0844682bc7ada5"
-dependencies = [
- "hash32",
- "stable_deref_trait",
-]
 
 [[package]]
 name = "indexmap"
@@ -479,12 +454,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
-name = "spi_dma_ads131"
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+dependencies = [
+ "serde_core",
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "shared"
 version = "0.1.0"
 dependencies = [
- "fugit",
- "heapless",
- "stm32h7xx-hal",
+ "serde",
 ]
 
 [[package]]
@@ -495,7 +498,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
 name = "stm32_firmware"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -503,10 +506,9 @@ dependencies = [
  "defmt-rtt",
  "fugit",
  "panic-probe",
- "pwm_tim1",
  "rtic",
  "rtic-monotonics",
- "spi_dma_ads131",
+ "shared",
  "stm32h7xx-hal",
 ]
 
