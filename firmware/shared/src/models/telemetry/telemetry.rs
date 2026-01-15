@@ -31,3 +31,15 @@ pub enum Command {
     ClearFaults,
     Ping(u32),
 }
+
+/**
+ * i mean the i'd like the telemetry to show on a time graph
+ * where it keeps drawing and scrolling auto magically
+ * (but we can see the history if need be
+ * (the screen splits halfway so we always see the current data while exploring the past data,
+ * if for some reason we're investigating why there might have been a hiccup perhaps
+ * (i'm thinking of having a overview
+ * (raw number showing for each thing like rpm, temp, etc)
+ * and then giving each data a point/line on a line graph, i'd account for scaling of course)
+ *
+ */

@@ -1,99 +1,126 @@
-# Guv'nuh – Embedded Governor Development Platform
+# Guv'nuh – Resilient Micro-Grid Control Platform
 
-A laboratory‑scale governor that converts a 0.5 HP induction machine into a **programmable micro‑generator**, providing a complete test‑bed for turbine‑control firmware, safety engineering, and grid‑interface studies.
-
----
-
-##   Project Purpose
-
-> Deliver a fully documented, safety‑rated governor reference design that demonstrates the firmware, hardware, and workflow competencies required for entry‑level controls positions/ firmware engineer.
+A laboratory‑scale governor architecture that converts a standard induction machine into a **secure, programmable micro‑generator**. This platform demonstrates a "Zero-Trust" industrial control loop, fusing hard real-time safety (STM32/RTIC) with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 
 ---
 
-##   Functional Scope (Phase‑1)
+##    Project Purpose
 
-| ID     | Requirement                         | Target Value                     |
-| ------ | ----------------------------------- | -------------------------------- |
-|  F‑01  | Closed‑loop speed regulation        | ±2 % droop, 0–1 kW range         |
-|  F‑02  | Overspeed trip to safe torque‑off   | < 150 ms                         |
-|  F‑03  | Dual, diverse current feedback      | Hall CT + shunt (mismatch ≤ 5 %) |
-|  F‑04  | 24 V SELV control‑power segregation | EN 60204‑1 compliant             |
-|  F‑05  | Modbus‑RTU supervision              | 115 200 baud half‑duplex         |
-
-Phase‑2 will add EtherCAT/CiA‑402; Phase‑3 will replace the resistor load with a 48 V storage converter.
+> To engineer a NERC-CIP compliant governor reference design that decouples **Physics** (Safety Critical) from **Connectivity** (Telemetry), demonstrating the complete engineering pipeline from PCB design to Cloud SCADA.
 
 ---
 
-##   Repository Structure
+##    Functional Scope (Phase‑1)
+
+| ID | Requirement | Target Value |
+| --- | --- | --- |
+| **F‑01** | Closed‑loop speed regulation | ±2 % droop, 0–1 kW range |
+| **F‑02** | Overspeed trip to safe torque‑off | < 12 ms (Hardware Interrupt) |
+| **F‑03** | **Load Rejection Response** | **Recovery < 2s (100%  0% Load Step)** |
+| **F‑04** | "Apollo 9" Boot Handshake | Machine locked until Cloud Authorization |
+| **F‑05** | Telemetry Segregation | "Air-gapped" DMA UART Link |
+
+*Phase‑2 targets EtherCAT integration; Phase‑3 integrates 48V storage converters.*
+
+---
+
+##    Repository Structure (Cargo Workspace)
+
+This project utilizes a **Rust Monorepo** architecture to ensure Type Safety across Firmware and Cloud.
+
+```text
+.
+├── shared/                  ↳ Common Structs (Wire-safe data models)
+├── firmware/
+│   ├── governor-stm32/      ↳ Hard Real-Time (RTIC, No-std)
+│   │   └── src/app/states/  ↳ 8_load_rejection.rs, 10_estop.rs
+│   └── gateway-esp32/       ↳ Telemetry Gateway (Rust std / ESP-IDF)
+├── hardware/                ↳ KiCad sources, BOMs, Gerbers
+├── simulations/             ↳ MATLAB/Python Feed-forward analysis
+└── ci/                      ↳ GitHub Actions (Cross-compile + Test)
 
 ```
-├── docs/                    ↳ Requirements → architecture → wiring → reference
-├── hardware/                ↳ KiCad sources, STEP files, BOMs, Gerbers
-├── firmware/                ↳ Rust 2024 RTIC crates (stm32 & esp32)
-├── software_tools/          ↳ Modbus CLI, data‑logger utilities
-├── simulations/             ↳ Spice and MATLAB/Python control analysis
-├── tests/                   ↳ Smoke, power, regression scripts
-└── ci/                      ↳ GitHub Actions (PCB + firmware builds)
-```
-
-Detailed diagrams are located in **`docs/10_architecture/`**; frozen schematics and assemblies in **`hardware/pdf_plots/`**.
 
 ---
 
-##   Technology Stack
+##    System Architecture
 
-| Layer             | Implementation                                       | Rationale                       |
-| ----------------- | ---------------------------------------------------- | ------------------------------- |
-| MCU firmware      | Rust 2024 + **RTIC** on STM32H753                    | Memory‑safe deterministic tasks |
-| Fieldbus          | Modbus‑RTU (RS‑485) → EtherCAT (Phase‑2)             | Covers legacy and modern plants |
-| Control algorithm | PI + droop, adaptive gain scheduler                  | Mirrors hydro governor practice |
-| Safety            | Dual‑sensor voting, STO relay, MISRA static analysis | Aligns with IEC 61508 SIL‑2     |
-| UX                | UART CLI + React/Next.js dashboard (Wi‑Fi co‑proc)   | Field & SCADA‑ready interfaces  |
+### 1. The Governor (STM32H7 + RTIC)
 
----
+* **Role:** The "Physics Engine."
+* **Responsibility:** Manages the PID Loop, Safety Interlocks, and Valve Actuation (Once Steam Turbine is built).
+* **Key Feature:** **Priority-Based Preemption.** The `ESTOP` interrupt (Priority 5) and `Load Rejection` logic (Priority 3) can instantly preempt telemetry tasks (Priority 1).
+* **State Machine:** Implements a formalized `BOOT`  `CALIBRATE`  `GENERATE` lifecycle.
 
-##   Milestone Road‑map ( 26 weeks )
+### 2. The Gateway (ESP32 + Rust std)
 
-| Week | Deliverable                  | Competence Demonstrated             |
-| ---- | ---------------------------- | ----------------------------------- |
-|  3   | SPI DMA stream (ADS131M04)   | High‑rate data path, cache control  |
-|  9   | Closed‑loop PI on VFD        | Robust control on real hardware     |
-|  13  | Sensor PCB smoke‑test CI     | Hardware diversity & automation     |
-|  19  | Overspeed trip demo          | Safety & fault handling             |
-|  22  | MISRA static‑analysis report | Standards compliance                |
-|  26  | Application packet submitted | Complete portfolio ready for review |
+* **Role:** The "Scribe."
+* **Responsibility:** Buffers high-frequency telemetry and handles the TLS handshake with the VPS.
+* **Isolation:** Connected via **UART DMA**. The ESP32 cannot "write" to the Governor's control variables, only request state changes via a sanitized mailbox.
 
-The full week‑by‑week table is maintained in **`docs/90_release_notes/roadmap_26wk.md`**.
+### 3. The Cloud (Dioxus + SurrealDB)
+
+* **Role:** The "Command Center."
+* **Responsibility:** Authorization Server ("Permissive Action Link") and Live Dashboard.
+* **Tech:** Rust Full-stack. The frontend and backend share the exact same data types as the firmware via the `shared` library.
 
 ---
 
-##   Build & Flash
+##    Technology Stack
+
+| Layer | Implementation | Rationale |
+| --- | --- | --- |
+| **Safety Core** | **Rust RTIC** on STM32H753 | Zero-cost abstractions, data-race freedom |
+| **Telemetry** | **Rust std** on ESP32-C3 | Secure memory-safe networking stack |
+| **Backend** | **Dioxus** + **SurrealDB** | Type-safe "Hardware-to-UI" pipeline |
+| **Control** | PID + **Feed-Forward (Derivative Kick)** | Handling drastic Load Rejection events |
+| **Safety** | Hardware Interrupt (EXTI) + **Watchdog** | SIL-2 Compliance (Fail-Safe) |
+
+---
+
+##    Milestone Road‑map (Jan – June 2026)
+
+| Month | Deliverable | Competence Demonstrated |
+| --- | --- | --- |
+| **Jan** | **M-G Set & RTIC Boot** | Hardware wrapper abstraction, Monotonic timer |
+| **Feb** | **"Apollo 9" Handshake** | Blocking Boot Logic, ESP32<->STM32 Serialization |
+| **Mar** | **PID & Feed-Forward** | Stable 60Hz generation under static load |
+| **Apr** | **Load Rejection** | **Critical:** Catching RPM spikes (100% Load Drop) |
+| **May** | **Cloud Dashboard** | Dioxus/Grafana visualization of live telemetry |
+| **Jun** | **Portfolio Release** | Full documentation, video demo, and CI/CD Freeze |
+
+Detailed tracking available in **`docs/90_release_notes/roadmap.md`**.
+
+---
+
+##    Build & Flash
+
+The workspace handles dependencies automatically.
 
 ```bash
-# clone and build
-$ git clone https://github.com/gaussindustries/guvnuh-rs.git
-$ cd guvnuh-rs
-$ rustup target add thumbv7em-none-eabihf
-$ cargo build -p stm32_firmware --release --target thumbv7em-none-eabihf
+# 1. Build the Shared Library & Firmware
+$ cargo build --release --workspace
 
-# program via ST‑LINK (using opencd) [firmware/stm32/flash-stm32-opencd.sh]
-$  bash firmware/stm32/gdb_flash.sh
-```
+# 2. Flash the Governor (STM32)
+# Uses OpenOCD via custom shell script
+$ bash firmware/governor-stm32/scripts/flash.sh
 
-```
-# debug via GNU Debugger [firmware/stm32/gdb_flash.sh]
-$  bash firmware/stm32/gdb_flash.sh
+# 3. Flash the Gateway (ESP32)
+# Uses espflash
+$ espflash flash firmware/gateway-esp32/target/riscv32imc.../release/gateway
+
+# 4. Run the Backend (Local Dev)
+$ cd backend && dx serve
+
 ```
 
 ---
 
-##   Standards Referenced
+##    Standards Referenced
 
-* IEC 61800‑5‑2 (STO)   *hardware interlock*
-* IEC 61508 SIL‑2       *safety life‑cycle & diagnostics*
-* ISA‑50 / Modbus‑RTU   *legacy plant communication*
-* IEEE 519              *harmonic & ripple measurement*
+* **IEC 61508 SIL‑2** – *Safety life‑cycle & diagnostics*
+* **NERC CIP-003** – *Cyber Security — Security Management Controls*
+* **IEEE 1547** – *Interconnection and Interoperability of Distributed Energy Resources*
+* **MISRA C / Rust 2024** – *High-integrity coding guidelines*
 
----
-
-© 2025 Juan Carlos Mancilla Jr  · MIT License
+© 2026 Juan Carlos Mancilla Jr  · MIT License
