@@ -86,7 +86,7 @@ This project utilizes a **Rust Monorepo** architecture to ensure Type Safety acr
 | **Feb** | **"Apollo 9" Handshake** | Blocking Boot Logic, ESP32<->STM32 Serialization |
 | **Mar** | **PID & Feed-Forward** | Stable 60Hz generation under static load |
 | **Apr** | **Load Rejection** | **Critical:** Catching RPM spikes (100% Load Drop) |
-| **May** | **Cloud Dashboard** | Dioxus/Grafana visualization of live telemetry |
+| **May** | **Cloud Dashboard** | Dioxus visualization of live telemetry |
 | **Jun** | **Portfolio Release** | Full documentation, video demo, and CI/CD Freeze |
 
 Detailed tracking available in **`docs/90_release_notes/roadmap.md`**.

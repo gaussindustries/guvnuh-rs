@@ -8,4 +8,4 @@ path = "src/lib.rs"
 
 [dependencies]
 # keep empty for now unless shared needs stuff
-serde ={ version = "*", features = ['derive']}
+serde = { version = "*", default-features = false, features = ["derive"] }

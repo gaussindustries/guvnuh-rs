@@ -15,7 +15,6 @@ rtic = { version = "2.0", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "2.1.0", features = ["cortex-m-systick"] }
 
 shared ={ path = "../shared"}
-models = { path = "./models"}
 
 # [dependencies.pwm_tim1]
 # path = "../drivers/pwm_tim1"

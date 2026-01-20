@@ -8,24 +8,20 @@ defmt::timestamp!("{=u64:us}", { 0 });
 use defmt_rtt as _; // link defmt logger
 use panic_probe as _; // link panic handler
 
-use fugit::ExtU64;
 use rtic::app;
 use rtic_monotonics::systick::prelude::*; // <- bring the macro prelude
 use stm32h7xx_hal::{
+    device::TIM1,
     gpio::{self, GpioExt, Output, PushPull},
     prelude::*,
+    pwm,
 };
 
+use cortex_m::peripheral::scb::SystemHandler;
+
 // Internal Modules
-mod models {
-    pub mod status;
-} // Expose local status
-mod app {
-    pub mod states {
-        pub mod boot; // Linked to 0_boot.rs via #[path] or direct
-        pub mod calibrate; // Linked to 1_calibrate.rs
-    }
-}
+mod guv;
+mod models;
 // Shared Librarys (for esp32/stm32)
 use crate::models::status::WorkerStatus;
 use shared::models::state::states::STATE;
@@ -33,7 +29,7 @@ use shared::models::state::states::STATE;
 // Create a SysTick-based monotonic named `Mono` that ticks at 1 kHz
 systick_monotonic!(Mono, 1_000);
 
-#[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1])]
+#[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
     use super::*;
 
@@ -44,6 +40,7 @@ mod app {
         ld2: gpio::Pin<'E', 1, Output<PushPull>>,  // orange/yellur
         ld3: gpio::Pin<'B', 14, Output<PushPull>>, // red
 
+        motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
         //funcs (funk)
 
         //structs
@@ -51,142 +48,193 @@ mod app {
     }
 
     #[local]
-    pub struct Local {}
+    pub struct Local {
+        calib_start_time: Option<u32>,
+    }
 
     // --- THE INIT WRAPPER ---
-        #[init]
-        fn init(cx: init::Context) -> (Shared, Local) {
-            defmt::info!("System Boot: Initializing...");
+    #[init]
+    fn init(mut cx: init::Context) -> (Shared, Local) {
+        defmt::info!("System Boot: Initializing...");
 
-            // 1. DELEGATE TO BOOT.RS
-            // The ugly hardware code is gone from main.rs!
-            let board = crate::app::states::boot::setup(cx.device);
+        // 1. DELEGATE TO BOOT.RS
+        let mut board = crate::guv::states::boot::setup(cx.device);
 
-            // 2. START SCHEDULER
-            let sys_freq = board.ccdr.clocks.sysclk().to_Hz();
-            Mono::start(cx.core.SYST, sys_freq);
-
-            // 3. SPAWN MANAGER
-            state_manager::spawn().ok();
-
-            // 4. RETURN RESOURCES
-            (
-                Shared {
-                    state: STATE::BOOT, // Start at 0
-                    ld1: board.ld1,
-                    ld2: board.ld2,
-                    ld3: board.ld3,
-                },
-                Local {},
-            )
+        unsafe {
+            cx.core.SCB.set_priority(SystemHandler::SysTick, 255);
         }
 
-        // --- THE CEO (State Manager) ---
-        #[task(priority = 1, shared = [state, ld1, ld2, ld3])]
-        fn state_manager(mut cx: state_manager::Context) {
+        // --- SAFETY: ENSURE MOTOR IS OFF ON BOOT ---
+        // Inverted Logic: Set Duty to MAX to turn motor OFF.
+        let max_duty = board.motor_pwm.get_max_duty();
+        board.motor_pwm.set_duty(max_duty);
+        // -------------------------------------------
 
-            // 1. Get Timestamp (for timeouts/logic)
-            let now = Mono::now().ticks();
+        // 2. START SCHEDULER
+        let sys_freq = board.clocks.sysclk().to_Hz();
+        Mono::start(cx.core.SYST, sys_freq);
 
-            // 2. Lock Resources
-            (cx.shared.state, cx.shared.ld2).lock(|state, ld1, ld2, ld3| {
+        // 3. SPAWN MANAGER
+        state_manager::spawn().ok();
 
+        board.ld3.set_high(); // Red LED on
+
+        // 4. RETURN RESOURCES
+        (
+            Shared {
+                state: STATE::BOOT,
+                ld1: board.ld1,
+                ld2: board.ld2,
+                ld3: board.ld3,
+                motor_pwm: board.motor_pwm,
+            },
+            Local {
+                calib_start_time: None,
+            },
+        )
+    }
+
+    // --- THE CEO (State Manager) ---
+    #[task(priority = 1, shared = [state, ld1, ld2, ld3, motor_pwm], local = [calib_start_time])]
+    async fn state_manager(mut cx: state_manager::Context) {
+        let mut ticks: u32 = 0;
+
+        loop {
+            cx.shared.state.lock(|state| {
                 match *state {
-                    // --- STATE 0: BOOT ---
                     STATE::BOOT => {
-                        // Logic: Boot.rs already ran during init.
-                        // We just confirm and move on.
-                        defmt::info!("Boot Complete. Transitioning to CALIBRATE.");
+                        defmt::info!("StateMachine: BOOT -> CALIBRATE");
+                        cx.shared.ld3.lock(|ld3| ld3.set_low());
+                        cx.shared.ld2.lock(|ld2| ld2.set_high());
                         *state = STATE::CALIBRATE;
-                    },
-
-                    // --- STATE 1: CALIBRATE ---
-                    STATE::CALIBRATE => {
-                        // Call the worker (Apollo 9 logic)
-                        // We assume calibrate::run returns WorkerStatus
-                        // let status = crate::app::states::calibrate::run(ld2, now);
-
-                        // For now, let's mock it to verify the structure:
-                        let status = WorkerStatus::Running; // Placeholder
-
-                        match status {
-                            WorkerStatus::Running => {
-                                // Do nothing, wait for next loop
-                                ld2.toggle(); // Visual indicator
-                            },
-                            WorkerStatus::Complete => {
-                                defmt::info!("Calibration Passed. System IDLE.");
-                                *state = STATE::IDLE;
-                            },
-                            WorkerStatus::Failed => {
-                                defmt::error!("Calibration Failed!");
-                                *state = STATE::FAULT;
-                            }
-                        }
-                    },
-
-                    // --- STATE 2: IDLE ---
-                    STATE::IDLE => {
-                        // Wait for start command...
-                    },
-
-                    // --- STATE 9: FAULT ---
-                    STATE::FAULT => {
-                        // Blink Red LED forever
-                        // (We'll move this to 9_fault.rs later)
+                        ticks = 0;
                     }
 
+                    STATE::CALIBRATE => {
+                        let elapsed_ms = ticks * 10;
+
+                        cx.shared.motor_pwm.lock(|motor| {
+                            let max_duty = motor.get_max_duty() as f32;
+
+                            // CHANGE 1: Bump Target to 50% or 100% so it definitely moves
+                            let target_speed_percent = 1.0; // 100% Speed
+
+                            // --- PHASE 1: RAMP UP (0s -> 5s) ---
+                            if elapsed_ms < 5000 {
+                                // Progress: 0.0 -> 1.0
+                                let progress = elapsed_ms as f32 / 5000.0;
+                                let desired_speed = progress * target_speed_percent;
+
+                                // INVERTED MATH (The Magic):
+                                // Real Speed 0%   = Duty MAX
+                                // Real Speed 100% = Duty 0
+                                let inverted_duty = max_duty - (max_duty * desired_speed);
+                                motor.set_duty(inverted_duty as u16);
+
+                                if ticks % 10 == 0 {
+                                    cx.shared.ld1.lock(|l| l.toggle());
+                                }
+                            }
+                            // --- PHASE 2: HOLD (5s -> 10s) ---
+                            else if elapsed_ms < 10000 {
+                                // Hold steady at Target Speed
+                                let desired_speed = target_speed_percent;
+
+                                let inverted_duty = max_duty - (max_duty * desired_speed);
+                                motor.set_duty(inverted_duty as u16);
+
+                                cx.shared.ld1.lock(|l| l.set_high());
+                            }
+                            // --- PHASE 3: RAMP DOWN (10s -> 15s) ---
+                            else if elapsed_ms < 15000 {
+                                // Ramp down from Target to 0%
+                                let ramp_down_progress = (elapsed_ms - 10000) as f32 / 5000.0;
+                                let desired_speed =
+                                    target_speed_percent * (1.0 - ramp_down_progress);
+
+                                let inverted_duty = max_duty - (max_duty * desired_speed);
+                                motor.set_duty(inverted_duty as u16);
+
+                                if ticks % 20 == 0 {
+                                    cx.shared.ld1.lock(|l| l.toggle());
+                                }
+                            }
+                            // --- FINISHED ---
+                            else {
+                                // Force STOP (Inverted: Max Duty)
+                                motor.set_duty(max_duty as u16);
+
+                                *state = STATE::IDLE;
+                                defmt::info!("Calibration Complete. Motor OFF.");
+                                cx.shared.ld2.lock(|l| l.set_low());
+                                cx.shared.ld1.lock(|l| l.set_high());
+                            }
+                        });
+                    }
+
+                    STATE::IDLE => {
+                        cx.shared.motor_pwm.lock(|motor| {
+                            let max = motor.get_max_duty();
+                            // Inverted: Max Duty = STOP
+                            motor.set_duty(max);
+                        });
+
+                        if ticks % 100 == 0 {
+                            cx.shared.ld3.lock(|ld3| ld3.toggle());
+                        }
+                    }
                     _ => {}
                 }
             });
 
-            // 3. The Heartbeat (Run again in 100ms)
-            state_manager::spawn_after(100.millis()).ok();
+            cortex_m::asm::delay(640_000);
+            ticks += 1;
         }
     }
+
     // 1 Hz: LD1
-    #[task(shared = [ld1])]
-    fn blink_ld1(mut cx: blink_ld1::Context) {
-        cx.shared.ld1.lock(|p| p.toggle());
-        blink_ld1::spawn_after(1.secs()).ok();
-    }
+    // #[task(shared = [ld1])]
+    // async fn blink_ld1(mut cx: blink_ld1::Context) {
+    //     cx.shared.ld1.lock(|p| p.toggle());
+    //     Mono::delay(1.secs()).await;
+    // }
 
-    // 2 Hz: LD2
-    #[task(shared = [ld2])]
-    fn blink_ld2(mut cx: blink_ld2::Context) {
-        cx.shared.ld2.lock(|p| p.toggle());
-        blink_ld2::spawn_after(500.millis()).ok();
-    }
+    // // 2 Hz: LD2
+    // #[task(shared = [ld2])]
+    // async fn blink_ld2(mut cx: blink_ld2::Context) {
+    //     cx.shared.ld2.lock(|p| p.toggle());
+    //     Mono::delay(500.millis()).await;
+    // }
 
-    // A mini “light show” to show spawn_at accuracy
-    #[task]
-    fn sequence_demo(_: sequence_demo::Context) {
-        let t0 = Mono::now();
-        step_ld3::spawn_at(t0).ok(); // t0
-        step_ld1::spawn_at(t0 + 100.millis()).ok(); // t0 + 100ms
-        step_ld2::spawn_at(t0 + 200.millis()).ok(); // t0 + 200ms
-        all_off::spawn_at(t0 + 400.millis()).ok(); // t0 + 400ms
-    }
+    // // A mini “light show” to show spawn_at accuracy
+    // // #[task]
+    // // async fn sequence_demo(_: sequence_demo::Context) {
+    // //     let t0 = Mono::now();
+    // //     step_ld3::spawn_at(t0).ok(); // t0
+    // //     step_ld1::spawn_at(t0 + 100.millis()).ok(); // t0 + 100ms
+    // //     step_ld2::spawn_at(t0 + 200.millis()).ok(); // t0 + 200ms
+    // //     all_off::spawn_at(t0 + 400.millis()).ok(); // t0 + 400ms
+    // // }
 
-    #[task(shared = [ld3])]
-    fn step_ld3(mut cx: step_ld3::Context) {
-        cx.shared.ld3.lock(|p| p.set_high());
-    }
-    #[task(shared = [ld1])]
-    fn step_ld1(mut cx: step_ld1::Context) {
-        cx.shared.ld1.lock(|p| p.set_high());
-    }
-    #[task(shared = [ld2])]
-    fn step_ld2(mut cx: step_ld2::Context) {
-        cx.shared.ld2.lock(|p| p.set_high());
-    }
+    // #[task(shared = [ld3])]
+    // async fn step_ld3(mut cx: step_ld3::Context) {
+    //     cx.shared.ld3.lock(|p| p.set_high());
+    // }
+    // #[task(shared = [ld1])]
+    // async fn step_ld1(mut cx: step_ld1::Context) {
+    //     cx.shared.ld1.lock(|p| p.set_high());
+    // }
+    // #[task(shared = [ld2])]
+    // async fn step_ld2(mut cx: step_ld2::Context) {
+    //     cx.shared.ld2.lock(|p| p.set_high());
+    // }
 
-    #[task(shared = [ld1, ld2, ld3])]
-    fn all_off(mut cx: all_off::Context) {
-        cx.shared.ld1.lock(|p| p.set_low());
-        cx.shared.ld2.lock(|p| p.set_low());
-        cx.shared.ld3.lock(|p| p.set_low());
-    }
+    // #[task(shared = [ld1, ld2, ld3])]
+    // async fn all_off(mut cx: all_off::Context) {
+    //     cx.shared.ld1.lock(|p| p.set_low());
+    //     cx.shared.ld2.lock(|p| p.set_low());
+    //     cx.shared.ld3.lock(|p| p.set_low());
+    // }
 }
 
 /*
