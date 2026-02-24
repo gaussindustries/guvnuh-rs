@@ -40,6 +40,8 @@ mod app {
         ld2: gpio::Pin<'E', 1, Output<PushPull>>,  // orange/yellur
         ld3: gpio::Pin<'B', 14, Output<PushPull>>, // red
 
+        relay: gpio::Pin<'E', 0, Output<PushPull>>,
+
         motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
         //funcs (funk)
 
@@ -86,6 +88,7 @@ mod app {
                 ld1: board.ld1,
                 ld2: board.ld2,
                 ld3: board.ld3,
+                relay: board.relay,
                 motor_pwm: board.motor_pwm,
             },
             Local {
@@ -95,7 +98,7 @@ mod app {
     }
 
     // --- THE CEO (State Manager) ---
-    #[task(priority = 1, shared = [state, ld1, ld2, ld3, motor_pwm], local = [calib_start_time])]
+    #[task(priority = 1, shared = [state, ld1, ld2, ld3, relay, motor_pwm], local = [calib_start_time])]
     async fn state_manager(mut cx: state_manager::Context) {
         let mut ticks: u32 = 0;
 
@@ -106,6 +109,18 @@ mod app {
                         defmt::info!("StateMachine: BOOT -> CALIBRATE");
                         cx.shared.ld3.lock(|ld3| ld3.set_low());
                         cx.shared.ld2.lock(|ld2| ld2.set_high());
+
+                        // SAFETY SEQUENCE:
+                        // Step A: Assert 0% speed (Max Duty for inverted logic)
+                        cx.shared.motor_pwm.lock(|motor| {
+                            let max_duty = motor.get_max_duty();
+                            motor.set_duty(max_duty);
+                        });
+
+                        // Step B: Turn on the relay to power the PWM controller
+                        cx.shared.relay.lock(|relay| relay.set_high());
+                        defmt::info!("Motor Relay: ENABLED");
+
                         *state = STATE::CALIBRATE;
                         ticks = 0;
                     }
@@ -164,8 +179,14 @@ mod app {
                                 // Force STOP (Inverted: Max Duty)
                                 motor.set_duty(max_duty as u16);
 
+                                // SAFETY: Shut off power to the controller
+                                cx.shared.relay.lock(|r| r.set_low());
+
                                 *state = STATE::IDLE;
-                                defmt::info!("Calibration Complete. Motor OFF.");
+                                defmt::info!("Calibration Complete. Motor & Relay OFF.");
+
+                                cx.shared.relay.lock(|r| r.set_low());
+
                                 cx.shared.ld2.lock(|l| l.set_low());
                                 cx.shared.ld1.lock(|l| l.set_high());
                             }

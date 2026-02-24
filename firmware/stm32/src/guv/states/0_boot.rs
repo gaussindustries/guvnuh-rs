@@ -12,6 +12,9 @@ pub struct Board {
     pub ld2: gpio::Pin<'E', 1, Output<PushPull>>,
     pub ld3: gpio::Pin<'B', 14, Output<PushPull>>,
 
+    //this enables motor power, will be used in E-Stop
+    pub relay: gpio::Pin<'E', 0, Output<PushPull>>,
+
     // CHANGED: Store only the Clock configuration, not the whole resource bag
     pub clocks: CoreClocks,
 
@@ -51,17 +54,22 @@ pub fn setup(dp: pac::Peripherals) -> Board {
 
     motor_pwm.enable();
     motor_pwm.set_duty(motor_pwm.get_max_duty());
+    let mut relay = gpioe.pe0.into_push_pull_output();
 
     // 4. Initial Safety State
     ld1.set_low();
     ld2.set_low();
     ld3.set_low();
 
+    //we need to send our pwm signal into the pwm controller first before we enable power to the dc motor
+    relay.set_low();
+
     Board {
         ld1,
         ld2,
         ld3,
-        clocks: ccdr.clocks,
+        relay,
         motor_pwm,
+        clocks: ccdr.clocks,
     }
 }
