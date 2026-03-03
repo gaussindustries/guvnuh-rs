@@ -1,13 +1,18 @@
 use stm32h7xx_hal::{
-    device::TIM1,
+    device::{TIM1, TIM2},
     gpio::{self, Output, PushPull},
     pac,
     prelude::*,
     pwm,
+    qei::{Qei, QeiExt},
     rcc::CoreClocks, // We only need CoreClocks, not the full Ccdr
 };
 
 pub struct Board {
+    pub clocks: CoreClocks,
+
+    //OUTPUTS
+    //LEDs red, yellow, green respectively
     pub ld1: gpio::Pin<'B', 0, Output<PushPull>>,
     pub ld2: gpio::Pin<'E', 1, Output<PushPull>>,
     pub ld3: gpio::Pin<'B', 14, Output<PushPull>>,
@@ -15,10 +20,11 @@ pub struct Board {
     //this enables motor power, will be used in E-Stop
     pub relay: gpio::Pin<'E', 0, Output<PushPull>>,
 
-    // CHANGED: Store only the Clock configuration, not the whole resource bag
-    pub clocks: CoreClocks,
-
     pub motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
+
+    //INPUTS
+    //batch for AMT102-V | rotary encoder (sys rpm)
+    pub encoder: Qei<TIM2>,
 }
 
 pub fn setup(dp: pac::Peripherals) -> Board {
@@ -33,6 +39,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
         .freeze(pwrcfg, &dp.SYSCFG);
 
     // 2. GPIO Split (Consumes GPIOB/E tokens from ccdr)
+    let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
     let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
     let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
@@ -56,6 +63,12 @@ pub fn setup(dp: pac::Peripherals) -> Board {
     motor_pwm.set_duty(motor_pwm.get_max_duty());
     let mut relay = gpioe.pe0.into_push_pull_output();
 
+    let enc_pin_a = gpioa.pa0.into_alternate::<1>();
+    let enc_pin_b = gpioa.pa1.into_alternate::<1>();
+
+    // Call .qei() with ONLY the pins and the peripheral token
+    let encoder = dp.TIM2.qei((enc_pin_a, enc_pin_b), ccdr.peripheral.TIM2);
+
     // 4. Initial Safety State
     ld1.set_low();
     ld2.set_low();
@@ -70,6 +83,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
         ld3,
         relay,
         motor_pwm,
+        encoder,
         clocks: ccdr.clocks,
     }
 }

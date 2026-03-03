@@ -11,10 +11,11 @@ use panic_probe as _; // link panic handler
 use rtic::app;
 use rtic_monotonics::systick::prelude::*; // <- bring the macro prelude
 use stm32h7xx_hal::{
-    device::TIM1,
+    device::{TIM1, TIM2},
     gpio::{self, GpioExt, Output, PushPull},
     prelude::*,
     pwm,
+    qei::Qei,
 };
 
 use cortex_m::peripheral::scb::SystemHandler;
@@ -31,6 +32,8 @@ systick_monotonic!(Mono, 1_000);
 
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
+    use stm32h7xx_hal::qei::Qei;
+
     use super::*;
 
     #[shared]
@@ -43,6 +46,8 @@ mod app {
         relay: gpio::Pin<'E', 0, Output<PushPull>>,
 
         motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
+
+        encoder: Qei<TIM2>,
         //funcs (funk)
 
         //structs
@@ -79,6 +84,8 @@ mod app {
         // 3. SPAWN MANAGER
         state_manager::spawn().ok();
 
+        rpm_monitor::spawn().ok();
+
         board.ld3.set_high(); // Red LED on
 
         // 4. RETURN RESOURCES
@@ -90,6 +97,7 @@ mod app {
                 ld3: board.ld3,
                 relay: board.relay,
                 motor_pwm: board.motor_pwm,
+                encoder: board.encoder,
             },
             Local {
                 calib_start_time: None,
@@ -120,6 +128,8 @@ mod app {
                         // Step B: Turn on the relay to power the PWM controller
                         cx.shared.relay.lock(|relay| relay.set_high());
                         defmt::info!("Motor Relay: ENABLED");
+
+                        //enable data stream, ensure it's being sent (uart for now, the server henceforth. perhaps file?)
 
                         *state = STATE::CALIBRATE;
                         ticks = 0;
@@ -213,6 +223,34 @@ mod app {
         }
     }
 
+    #[task(priority = 1, shared = [encoder])]
+        async fn rpm_monitor(mut cx: rpm_monitor::Context) {
+            let mut last_count: u32 = 0;
+
+            // UPDATE THIS BASED ON YOUR DIP SWITCHES (PPR * 4)
+            // e.g., 2048 PPR * 4 = 8192
+            let counts_per_rev: f32 = 8192.0;
+
+            loop {
+                // Wait exactly 1 second (1000 ms)
+                Mono::delay(1000u64.millis()).await;
+
+                cx.shared.encoder.lock(|enc| {
+                    // Read current hardware counter
+                    let current_count = enc.count();
+
+                    // wrapping_sub handles timer overflows safely
+                    let delta_counts = current_count.wrapping_sub(last_count);
+                    last_count = current_count;
+
+                    // Calculate RPM
+                    // (counts_per_second / counts_per_rev) * 60 seconds
+                    // Note: delta_counts is treated as an i32 to allow for negative RPM (reverse direction)
+                    let rpm = ((delta_counts as i32 as f32) / counts_per_rev) * 60.0;
+
+                    // Print directly to ST-Link debug console
+                    defmt::info!("Motor RPM: {} | Raw Delta: {}", rpm as i32, delta_counts as i32);
+                });
     // 1 Hz: LD1
     // #[task(shared = [ld1])]
     // async fn blink_ld1(mut cx: blink_ld1::Context) {
