@@ -5,6 +5,7 @@
 defmt::timestamp!("{=u64:us}", { 0 });
 
 // Imports
+use core::fmt::Write;
 use defmt_rtt as _; // link defmt logger
 use panic_probe as _; // link panic handler
 
@@ -49,6 +50,9 @@ mod app {
         motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
 
         encoder: Qei<TIM2>,
+
+        tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::pac::UART4>,
+
         //funcs (funk)
 
         //structs
@@ -76,7 +80,6 @@ mod app {
         // Inverted Logic: Set Duty to MAX to turn motor OFF.
         let max_duty = board.motor_pwm.get_max_duty();
         board.motor_pwm.set_duty(max_duty);
-        // -------------------------------------------
 
         // 2. START SCHEDULER
         let sys_freq = board.clocks.sysclk().to_Hz();
@@ -99,6 +102,7 @@ mod app {
                 relay: board.relay,
                 motor_pwm: board.motor_pwm,
                 encoder: board.encoder,
+                tx: board.tx,
             },
             Local {
                 calib_start_time: None,
@@ -224,36 +228,30 @@ mod app {
         }
     }
 
-    #[task(priority = 1, shared = [encoder])]
+    #[task(priority = 1, shared = [encoder, tx])] // <-- Add tx here
     async fn rpm_monitor(mut cx: rpm_monitor::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
-
-        // Add a loop counter
         let mut loop_counter: u32 = 0;
 
         loop {
-            // 1. Wait exactly 10 ms (Sample rate = 100 Hz)
             Mono::delay(10u32.millis()).await;
 
-            cx.shared.encoder.lock(|enc| {
+            // Lock BOTH the encoder and the transmitter
+            (&mut cx.shared.encoder, &mut cx.shared.tx).lock(|enc, tx| {
                 let current_count = enc.count();
                 let delta_counts = current_count.wrapping_sub(last_count);
                 last_count = current_count;
 
-                // Since delta_counts is only for 10ms, multiply by 100 to get counts-per-second
                 let counts_per_second = (delta_counts as i32 as f32) * 100.0;
-
-                // Now calculate RPM using the correct per-second value
                 let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
 
-                // Only print every 100th loop (which equals 1 second)
+                // Transmit over physical wire every 100 loops (1 second)
                 if loop_counter % 100 == 0 {
-                    defmt::info!(
-                        "Motor RPM: {} | Raw Delta (10ms): {}",
-                        rpm as i32,
-                        delta_counts as i32
-                    );
+                    defmt::info!("Motor RPM: {}", rpm as i32);
+
+                    // THIS WRITES TO THE ESP32!
+                    writeln!(tx, "RPM:{}\r", rpm as i32).ok();
                 }
             });
 

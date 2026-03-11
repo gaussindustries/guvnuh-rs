@@ -1,3 +1,0 @@
-cargo build -p stm32_firmware --release --target thumbv7em-none-eabihf
-
- ./firmware/stm32/scripts/flash-stm32-opencd.sh target/thumbv7em-none-eabihf/release/stm32_firmware

@@ -6,6 +6,7 @@ use stm32h7xx_hal::{
     pwm,
     qei::{Qei, QeiExt},
     rcc::CoreClocks, // We only need CoreClocks, not the full Ccdr
+    serial,
 };
 
 pub struct Board {
@@ -21,6 +22,8 @@ pub struct Board {
     pub relay: gpio::Pin<'E', 0, Output<PushPull>>,
 
     pub motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
+
+    pub tx: serial::Tx<pac::UART4>,
 
     //INPUTS
     //batch for AMT102-V | rotary encoder (sys rpm)
@@ -41,6 +44,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
     // 2. GPIO Split (Consumes GPIOB/E tokens from ccdr)
     let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
     let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
+    let gpioc = dp.GPIOC.split(ccdr.peripheral.GPIOC);
     let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
     // 3. Pin Config
@@ -64,12 +68,30 @@ pub fn setup(dp: pac::Peripherals) -> Board {
 
     let mut relay = gpioe.pe0.into_push_pull_output();
 
-    //a & b channel pin pair for rotary encoder
+    //a & b channel pair for rotary encoder
     let enc_pin_a = gpioa.pa0.into_alternate::<1>();
     let enc_pin_b = gpioa.pa1.into_alternate::<1>();
 
     // Call .qei() with ONLY the pins and the peripheral token
     let encoder = dp.TIM2.qei((enc_pin_a, enc_pin_b), ccdr.peripheral.TIM2);
+
+    // 1. Configure UART4 Pins (for DMA to esp32)
+    let tx_pin = gpioc.pc10.into_alternate::<8>();
+    let rx_pin = gpioc.pc11.into_alternate::<8>();
+
+    // 2. Initialize the Serial port at 115200 baud
+    let mut serial = dp
+        .UART4
+        .serial(
+            (tx_pin, rx_pin),
+            115_200.bps(),
+            ccdr.peripheral.UART4,
+            &ccdr.clocks,
+        )
+        .unwrap();
+
+    // 3. Split it so we only keep the Transmitter (Tx)
+    let (tx, _rx) = serial.split();
 
     // 4. Initial Safety State
     ld1.set_low();
@@ -86,6 +108,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
         relay,
         motor_pwm,
         encoder,
+        tx,
         clocks: ccdr.clocks,
     }
 }

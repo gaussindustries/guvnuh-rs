@@ -2,3 +2,11 @@
 name = "esp32_firmware"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+# Link the shared struct library
+shared = { path = "../shared" }
+
+esp-hal = { version = "1.0.0", features = ["esp32", "rt"] }
+esp-println = { version = "0.16.1", features = ["esp32"] }
+esp-backtrace = { version = "0.18.1", features = ["esp32", "panic-handler", "println"] }
