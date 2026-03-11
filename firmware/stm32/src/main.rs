@@ -9,7 +9,8 @@ use defmt_rtt as _; // link defmt logger
 use panic_probe as _; // link panic handler
 
 use rtic::app;
-use rtic_monotonics::systick::prelude::*; // <- bring the macro prelude
+use rtic_monotonics::fugit::ExtU32;
+use rtic_monotonics::systick::prelude::*;
 use stm32h7xx_hal::{
     device::{TIM1, TIM2},
     gpio::{self, GpioExt, Output, PushPull},
@@ -218,39 +219,44 @@ mod app {
                 }
             });
 
-            cortex_m::asm::delay(640_000);
+            Mono::delay(10u32.millis()).await;
             ticks += 1;
         }
     }
 
     #[task(priority = 1, shared = [encoder])]
-        async fn rpm_monitor(mut cx: rpm_monitor::Context) {
-            let mut last_count: u32 = 0;
+    async fn rpm_monitor(mut cx: rpm_monitor::Context) {
+        let mut last_count: u32 = 0;
 
-            // UPDATE THIS BASED ON YOUR DIP SWITCHES (PPR * 4)
-            // e.g., 2048 PPR * 4 = 8192
-            let counts_per_rev: f32 = 8192.0;
+        //DIP SWITCHES SET TO 0000: 2048 PPR * 4 = 8192
+        let counts_per_rev: f32 = 8192.0;
 
-            loop {
-                // Wait exactly 1 second (1000 ms)
-                Mono::delay(1000u64.millis()).await;
+        loop {
+            // Wait exactly 1 second (1000 ms)
+            Mono::delay(1000u32.millis()).await;
 
-                cx.shared.encoder.lock(|enc| {
-                    // Read current hardware counter
-                    let current_count = enc.count();
+            cx.shared.encoder.lock(|enc| {
+                // Read current hardware counter
+                let current_count = enc.count();
 
-                    // wrapping_sub handles timer overflows safely
-                    let delta_counts = current_count.wrapping_sub(last_count);
-                    last_count = current_count;
+                // wrapping_sub handles timer overflows safely
+                let delta_counts = (current_count.wrapping_sub(last_count));
+                last_count = current_count;
 
-                    // Calculate RPM
-                    // (counts_per_second / counts_per_rev) * 60 seconds
-                    // Note: delta_counts is treated as an i32 to allow for negative RPM (reverse direction)
-                    let rpm = ((delta_counts as i32 as f32) / counts_per_rev) * 60.0;
+                // Calculate RPM
+                // (counts_per_second / counts_per_rev) * 60 seconds
+                // Note: delta_counts is treated as an i32 to allow for negative RPM (reverse direction)
+                let rpm = (((delta_counts as i32 as f32) / counts_per_rev) * 60.0) * -1.0;
 
-                    // Print directly to ST-Link debug console
-                    defmt::info!("Motor RPM: {} | Raw Delta: {}", rpm as i32, delta_counts as i32);
-                });
+                // Print directly to ST-Link debug console
+                defmt::info!(
+                    "Motor RPM: {} | Raw Delta: {}",
+                    rpm as i32,
+                    delta_counts as i32
+                );
+            });
+        }
+    }
     // 1 Hz: LD1
     // #[task(shared = [ld1])]
     // async fn blink_ld1(mut cx: blink_ld1::Context) {

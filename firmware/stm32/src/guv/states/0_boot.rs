@@ -48,7 +48,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
     let mut ld2 = gpioe.pe1.into_push_pull_output();
     let mut ld3 = gpiob.pb14.into_push_pull_output();
 
-    // PWM Setup
+    // PWM Setup (Pin D7[PWM])
     let pwm_pin = gpioe.pe9.into_alternate::<1>();
 
     // Consumes TIM1 token from ccdr
@@ -61,8 +61,10 @@ pub fn setup(dp: pac::Peripherals) -> Board {
 
     motor_pwm.enable();
     motor_pwm.set_duty(motor_pwm.get_max_duty());
+
     let mut relay = gpioe.pe0.into_push_pull_output();
 
+    //a & b channel pin pair for rotary encoder
     let enc_pin_a = gpioa.pa0.into_alternate::<1>();
     let enc_pin_b = gpioa.pa1.into_alternate::<1>();
 
