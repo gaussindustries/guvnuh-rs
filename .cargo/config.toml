@@ -14,4 +14,4 @@ channel = "esp"
 
 [alias]
 stm32-flash = "run -p stm32_firmware --release --target thumbv7em-none-eabihf"
-esp32-flash = "run -p esp32_firmware --release --target xtensa-esp32-none-elf -Z build-std=core"
+esp32-flash = "run -p esp32_firmware --release --target xtensa-esp32-none-elf -Z build-std=core,alloc"
