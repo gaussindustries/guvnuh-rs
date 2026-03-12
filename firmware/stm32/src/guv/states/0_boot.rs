@@ -23,11 +23,15 @@ pub struct Board {
 
     pub motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
 
+    //UART
     pub tx: serial::Tx<pac::UART4>,
 
     //INPUTS
     //batch for AMT102-V | rotary encoder (sys rpm)
     pub encoder: Qei<TIM2>,
+
+    //UART
+    pub rx: serial::Rx<pac::UART4>,
 }
 
 pub fn setup(dp: pac::Peripherals) -> Board {
@@ -91,7 +95,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
         .unwrap();
 
     // 3. Split it so we only keep the Transmitter (Tx)
-    let (tx, _rx) = serial.split();
+    let (tx, rx) = serial.split();
 
     // 4. Initial Safety State
     ld1.set_low();
@@ -109,6 +113,7 @@ pub fn setup(dp: pac::Peripherals) -> Board {
         motor_pwm,
         encoder,
         tx,
+        rx,
         clocks: ccdr.clocks,
     }
 }

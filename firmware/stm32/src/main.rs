@@ -52,6 +52,7 @@ mod app {
         encoder: Qei<TIM2>,
 
         tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::pac::UART4>,
+        rx: stm32h7xx_hal::serial::Rx<stm32h7xx_hal::pac::UART4>,
 
         //funcs (funk)
 
@@ -62,6 +63,7 @@ mod app {
     #[local]
     pub struct Local {
         calib_start_time: Option<u32>,
+        safety_init_done: bool,
     }
 
     // --- THE INIT WRAPPER ---
@@ -103,15 +105,31 @@ mod app {
                 motor_pwm: board.motor_pwm,
                 encoder: board.encoder,
                 tx: board.tx,
+                rx: board.rx,
             },
             Local {
                 calib_start_time: None,
+                safety_init_done: false,
             },
         )
     }
 
     // --- THE CEO (State Manager) ---
-    #[task(priority = 1, shared = [state, ld1, ld2, ld3, relay, motor_pwm], local = [calib_start_time])]
+    #[task(priority = 1,
+        shared = [
+            state,
+            ld1,
+            ld2,
+            ld3,
+            relay,
+            motor_pwm,
+            tx,
+            rx
+        ],
+        local = [
+            calib_start_time,
+            safety_init_done
+        ])]
     async fn state_manager(mut cx: state_manager::Context) {
         let mut ticks: u32 = 0;
 
@@ -119,24 +137,58 @@ mod app {
             cx.shared.state.lock(|state| {
                 match *state {
                     STATE::BOOT => {
-                        defmt::info!("StateMachine: BOOT -> CALIBRATE");
-                        cx.shared.ld3.lock(|ld3| ld3.set_low());
-                        cx.shared.ld2.lock(|ld2| ld2.set_high());
+                        defmt::info!("StateMachine: BOOT");
 
                         // SAFETY SEQUENCE:
-                        // Step A: Assert 0% speed (Max Duty for inverted logic)
-                        cx.shared.motor_pwm.lock(|motor| {
-                            let max_duty = motor.get_max_duty();
-                            motor.set_duty(max_duty);
+                        // Step 1: Assert 0% speed (Max Duty for inverted logic)
+                        if !*cx.local.safety_init_done {
+                            cx.shared.motor_pwm.lock(|motor| {
+                                let max_duty = motor.get_max_duty();
+                                motor.set_duty(max_duty);
+                            });
+                            cx.shared.relay.lock(|relay| relay.set_low());
+                            defmt::info!("Safety init complete.");
+                            *cx.local.safety_init_done = true;
+                        }
+
+                        // Step 3: enable data stream, ensure it's being sent (uart for now, the server henceforth. perhaps file?)
+                        cx.shared.tx.lock(|tx| {
+                            writeln!(tx, "HELLO\r").ok();
                         });
 
-                        // Step B: Turn on the relay to power the PWM controller
-                        cx.shared.relay.lock(|relay| relay.set_high());
-                        defmt::info!("Motor Relay: ENABLED");
+                        // Try to read OK response (non-blocking)
+                        let got_ok = cx.shared.rx.lock(|rx| {
+                            let mut buf = [0u8; 4];
+                            let mut i = 0;
+                            while i < 4 {
+                                match rx.read() {
+                                    Ok(b) => {
+                                        buf[i] = b;
+                                        i += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            &buf[..i] == b"OK\r\n" || &buf[..i] == b"OK\r"
+                        });
 
-                        //enable data stream, ensure it's being sent (uart for now, the server henceforth. perhaps file?)
-
-                        *state = STATE::CALIBRATE;
+                        if got_ok {
+                            defmt::info!("Handshake OK — proceeding to CALIBRATE");
+                            cx.shared.ld3.lock(|ld3| ld3.set_low());
+                            cx.shared.ld2.lock(|ld2| ld2.set_high());
+                            cx.shared.motor_pwm.lock(|motor| {
+                                let max_duty = motor.get_max_duty();
+                                motor.set_duty(max_duty);
+                            });
+                            cx.shared.relay.lock(|relay| relay.set_high());
+                            *state = STATE::CALIBRATE;
+                            ticks = 0;
+                        } else {
+                            // Still waiting — blink red LED
+                            cx.shared.ld3.lock(|ld3| ld3.toggle());
+                            defmt::info!("Waiting for ESP32 handshake...");
+                            // stay in BOOT, loop will retry in 10ms
+                        }
                         ticks = 0;
                     }
 

@@ -28,7 +28,6 @@ use esp_println::{print, println};
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // Onboard LED on GPIO2 — lights up when booted and ready
     let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
 
     let mut uart1 = Uart::new(peripherals.UART1, Config::default())
@@ -36,14 +35,38 @@ fn main() -> ! {
         .with_tx(peripherals.GPIO17)
         .with_rx(peripherals.GPIO16);
 
-    // Ready — LED on
-    led.set_high();
-    println!("ESP32 Gateway Booted. Listening to STM32...");
+    println!("ESP32 Booted. Waiting for STM32 handshake...");
 
     let mut buf = [0u8; 1];
+    let mut window = [0u8; 5]; // sliding window of last 5 bytes
+
     loop {
-        if let Ok(bytes_read) = uart1.read(&mut buf) {
-            if bytes_read > 0 {
+        if let Ok(n) = uart1.read(&mut buf) {
+            if n > 0 {
+                let b = buf[0];
+
+                // Shift window left, append new byte
+                window[0] = window[1];
+                window[1] = window[2];
+                window[2] = window[3];
+                window[3] = window[4];
+                window[4] = b;
+
+                if &window == b"HELLO" {
+                    uart1.write(b"OK\r\n").ok();
+                    led.set_high();
+                    println!("Handshake complete — STM32 is GO");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Normal operation loop
+    let mut buf = [0u8; 1];
+    loop {
+        if let Ok(n) = uart1.read(&mut buf) {
+            if n > 0 {
                 led.toggle();
                 print!("{}", buf[0] as char);
             }
