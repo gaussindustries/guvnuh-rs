@@ -1,6 +1,3 @@
-Based on what we've actually built, here's the updated README:
-
-```markdown
 # Guv'nuh – Resilient Micro-Grid Control Platform
 
 A laboratory-scale governor architecture that converts a standard DC motor into a
@@ -35,7 +32,6 @@ with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 
 This project utilizes a **Rust Monorepo** architecture to ensure type safety
 across firmware and cloud layers.
-
 ```text
 .
 ├── shared/                  ↳ Common Structs (Wire-safe data models, no_std)
@@ -55,7 +51,6 @@ across firmware and cloud layers.
 ---
 
 ## System Architecture
-
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     SAFETY DOMAIN                        │
@@ -155,7 +150,6 @@ The following has been validated end-to-end on hardware:
 ## Build & Flash
 
 ### Prerequisites
-
 ```bash
 # STM32 toolchain
 rustup target add thumbv7em-none-eabihf
@@ -168,7 +162,6 @@ espup install
 ```
 
 ### Flash
-
 ```bash
 # Flash STM32 Governor
 cargo stm32-flash
@@ -179,7 +172,6 @@ cargo esp32-flash
 ```
 
 ### Test Live Telemetry
-
 ```bash
 # After both boards are running and ESP32 prints its IP:
 nc <esp32_ip> 3000
@@ -210,4 +202,3 @@ nc <esp32_ip> 3000
 ---
 
 © 2026 Juan Carlos Mancilla Jr · MIT License
-```
