@@ -15,7 +15,9 @@ with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 
 ---
 
-## Functional Scope (Phase-1)
+## Functional Scope
+
+### Phase 1 — Governor Brains (Current)
 
 | ID | Requirement | Target Value | Status |
 | --- | --- | --- | --- |
@@ -26,7 +28,34 @@ with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 | **F-05** | Telemetry Segregation | "Air-gapped" UART Link | ✅ Complete |
 | **F-06** | Intranet Telemetry Stream | Live RPM over TCP/WiFi | ✅ Complete |
 
----
+The priority for Phase 1 is validating the complete control loop in software
+before introducing any high-energy physical plant. All development is conducted
+against a DC motor testbed.
+
+### Phase 2 — EtherCAT Integration
+
+Replaces the UART telemetry link with an EtherCAT fieldbus, enabling
+deterministic sub-millisecond communication between the Governor and
+downstream field devices. This phase targets industrial interoperability
+and positions the platform against real SCADA deployments.
+
+### Phase 3 — 48V Storage Converters
+
+Integrates bidirectional DC-DC converters for a 48V battery storage bank,
+enabling islanded operation, load leveling, and grid-forming capability.
+Adds a second control loop for state-of-charge management alongside the
+existing speed governor.
+
+### Phase 4 — Micro Steam Turbine *(Future Reference)*
+
+> ⚠️ High temperature and pressure — deferred until Phase 1 control logic
+> is fully validated and hardened.
+
+Replaces the DC motor testbed with a purpose-built micro steam turbine as
+the prime mover, completing the generator set. The Governor architecture
+is designed from the ground up to support this transition — the state
+machine, safety interlocks, and telemetry pipeline require no fundamental
+changes, only physical plant reconfiguration.
 
 ## Repository Structure (Cargo Workspace)
 
