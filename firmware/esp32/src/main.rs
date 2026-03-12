@@ -18,6 +18,7 @@
  */
 use esp_backtrace as _;
 use esp_hal::{
+    gpio::{Level, Output, OutputConfig},
     main,
     uart::{Config, Uart},
 };
@@ -25,22 +26,25 @@ use esp_println::{print, println};
 
 #[main]
 fn main() -> ! {
-    // 1. Changed back to default()
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // 2. Changed back to default()
+    // Onboard LED on GPIO2 — lights up when booted and ready
+    let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
+
     let mut uart1 = Uart::new(peripherals.UART1, Config::default())
         .unwrap()
         .with_tx(peripherals.GPIO17)
         .with_rx(peripherals.GPIO16);
 
+    // Ready — LED on
+    led.set_high();
     println!("ESP32 Gateway Booted. Listening to STM32...");
 
     let mut buf = [0u8; 1];
     loop {
-        // Read into a 1-byte buffer without blocking the CPU
         if let Ok(bytes_read) = uart1.read(&mut buf) {
             if bytes_read > 0 {
+                led.toggle();
                 print!("{}", buf[0] as char);
             }
         }
