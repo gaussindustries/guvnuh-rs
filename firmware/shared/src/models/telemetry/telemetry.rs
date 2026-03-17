@@ -1,3 +1,4 @@
+use crate::models::state::states::STATE;
 /**
  * i'd like the telemetry to show on a time graph
  * where it keeps drawing and scrolling auto magically
@@ -9,31 +10,32 @@
  * and then giving each data a point/line on a line graph, i'd account for scaling of course)
  *
  */
-use core::time::Duration;
 use serde::{Deserialize, Serialize};
 
-use crate::models::state::states::STATE;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Single telemetry sample — canonical wire format.
+/// Serialized via postcard/COBS over UART, deserialized on the server.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Telemetry {
     pub ts_ms: u32,
     pub state: STATE,
+    pub rpm: f32,
     pub v_gen_rms: f32,
     pub i_gen_rms: f32,
     pub freq_gen_hz: f32,
-    pub theta_err_rad: f32, // θ_gen - θ_ref
-    pub rpm: f32,
+    pub theta_err_rad: f32,
     pub temp_c: f32,
     pub dc_bus_v: f32,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Setpoints sent down from the dashboard
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Setpoints {
     pub ref_hz: f32,
     pub v_rms: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Commands from desktop → gaussindustri.es → ESP32 → STM32
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Command {
     Start,
     Stop,

@@ -44,7 +44,16 @@ use esp_wifi::{
 
 const SSID: &str = env!("WIFI_SSID");
 const PASS: &str = env!("WIFI_PASS");
-const PORT: u16 = 3000;
+const PORT: u16 = {
+    let s = env!("TCP_PORT").as_bytes();
+    let mut val: u16 = 0;
+    let mut i = 0;
+    while i < s.len() {
+        val = val * 10 + (s[i] - b'0') as u16;
+        i += 1;
+    }
+    val
+};
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -157,7 +166,6 @@ async fn wifi_task(mut controller: WifiController<'static>) {
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) {
     runner.run().await
 }
-
 #[embassy_executor::task]
 async fn tcp_task(
     stack: Stack<'static>,
@@ -182,8 +190,8 @@ async fn tcp_task(
     let mut rx_buf = [0u8; 1024];
     let mut tx_buf = [0u8; 1024];
     let mut uart_buf = [0u8; 1];
-    let mut line_buf = [0u8; 128];
-    let mut line_len = 0usize;
+    let mut cobs_buf = [0u8; 128];
+    let mut cobs_len = 0usize;
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
@@ -200,29 +208,39 @@ async fn tcp_task(
         {
             continue;
         }
-        println!("Desktop client connected!");
+        println!("Client connected!");
         led.set_high();
 
         'conn: loop {
-            // UART -> TCP (STM32 data to desktop)
+            // UART -> TCP (COBS framed telemetry from STM32)
             if uart.read(&mut uart_buf).is_ok() {
                 let b = uart_buf[0];
-                if b == b'\n' || line_len >= line_buf.len() - 1 {
-                    if socket.write_all(&line_buf[..line_len]).await.is_err() {
-                        break 'conn;
-                    }
-                    if socket.write_all(b"\n").await.is_err() {
-                        break 'conn;
-                    }
-                    line_len = 0;
-                } else {
-                    line_buf[line_len] = b;
-                    line_len += 1;
-                }
                 led.toggle();
+
+                if b == 0x00 {
+                    // End of COBS frame — forward complete frame + terminator
+                    if cobs_len > 0 {
+                        if socket.write_all(&cobs_buf[..cobs_len]).await.is_err() {
+                            break 'conn;
+                        }
+                        if socket.write_all(&[0x00]).await.is_err() {
+                            break 'conn;
+                        }
+                        cobs_len = 0;
+                    }
+                } else {
+                    // Accumulate frame bytes
+                    if cobs_len < cobs_buf.len() {
+                        cobs_buf[cobs_len] = b;
+                        cobs_len += 1;
+                    } else {
+                        // Buffer overflow — corrupted frame, discard
+                        cobs_len = 0;
+                    }
+                }
             }
 
-            // TCP -> UART non-blocking — only read if data is available
+            // TCP -> UART (Commands from server to STM32) non-blocking
             let mut cmd_buf = [0u8; 32];
             match embassy_futures::select::select(
                 socket.read(&mut cmd_buf),
@@ -240,6 +258,7 @@ async fn tcp_task(
         }
 
         println!("Client disconnected.");
+        cobs_len = 0; // reset on disconnect
         led.set_low();
     }
 }

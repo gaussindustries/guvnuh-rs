@@ -27,8 +27,8 @@ mod guv;
 mod models;
 // Shared Librarys (for esp32/stm32)
 use crate::models::status::WorkerStatus;
+use nb::block;
 use shared::models::state::states::STATE;
-
 // Create a SysTick-based monotonic named `Mono` that ticks at 1 kHz
 systick_monotonic!(Mono, 1_000);
 
@@ -280,32 +280,57 @@ mod app {
         }
     }
 
-    #[task(priority = 1, shared = [encoder, tx])] // <-- Add tx here
+    #[task(priority = 1, shared = [encoder, tx, state])]
     async fn rpm_monitor(mut cx: rpm_monitor::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
         let mut loop_counter: u32 = 0;
+        let mut ts_ms: u32 = 0;
 
         loop {
             Mono::delay(10u32.millis()).await;
+            ts_ms = ts_ms.wrapping_add(10);
 
-            // Lock BOTH the encoder and the transmitter
-            (&mut cx.shared.encoder, &mut cx.shared.tx).lock(|enc, tx| {
-                let current_count = enc.count();
-                let delta_counts = current_count.wrapping_sub(last_count);
-                last_count = current_count;
+            (
+                &mut cx.shared.encoder,
+                &mut cx.shared.tx,
+                &mut cx.shared.state,
+            )
+                .lock(|enc, tx, state| {
+                    let current_count = enc.count();
+                    let delta_counts = current_count.wrapping_sub(last_count);
+                    last_count = current_count;
 
-                let counts_per_second = (delta_counts as i32 as f32) * 100.0;
-                let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
+                    let counts_per_second = (delta_counts as i32 as f32) * 100.0;
+                    let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
 
-                // Transmit over physical wire every 100 loops (1 second)
-                if loop_counter % 100 == 0 {
-                    defmt::info!("Motor RPM: {}", rpm as i32);
+                    // Build telemetry frame
+                    let frame = shared::models::telemetry::telemetry::Telemetry {
+                        ts_ms,
+                        state: *state,
+                        rpm,
+                        v_gen_rms: 0.0,
+                        i_gen_rms: 0.0,
+                        freq_gen_hz: 0.0,
+                        theta_err_rad: 0.0,
+                        temp_c: 0.0,
+                        dc_bus_v: 0.0,
+                    };
 
-                    // THIS WRITES TO THE ESP32!
-                    writeln!(tx, "RPM:{}\r", rpm as i32).ok();
-                }
-            });
+                    // Serialize to COBS — max postcard size for this struct is ~40 bytes
+                    if *state != STATE::BOOT {
+                        let mut buf = [0u8; 64];
+                        if let Ok(encoded) = postcard::to_slice_cobs(&frame, &mut buf) {
+                            for byte in encoded.iter() {
+                                block!(tx.write(*byte)).ok();
+                            }
+                        }
+                    }
+
+                    if loop_counter % 100 == 0 {
+                        defmt::info!("RPM: {} STATE: {}", rpm as i32, state.as_str());
+                    }
+                });
 
             loop_counter = loop_counter.wrapping_add(1);
         }
