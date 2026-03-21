@@ -29,6 +29,7 @@ mod models;
 use crate::models::status::WorkerStatus;
 use nb::block;
 use shared::models::state::states::STATE;
+use shared::models::telemetry::telemetry::Command;
 // Create a SysTick-based monotonic named `Mono` that ticks at 1 kHz
 systick_monotonic!(Mono, 1_000);
 
@@ -64,6 +65,8 @@ mod app {
     pub struct Local {
         calib_start_time: Option<u32>,
         safety_init_done: bool,
+        cmd_buf: [u8; 64], // COBS accumulation buffer for incoming commands
+        cmd_len: usize,    // current position in cmd_buf
     }
 
     // --- THE INIT WRAPPER ---
@@ -110,6 +113,8 @@ mod app {
             Local {
                 calib_start_time: None,
                 safety_init_done: false,
+                cmd_buf: [0u8; 64],
+                cmd_len: 0,
             },
         )
     }
@@ -128,12 +133,52 @@ mod app {
         ],
         local = [
             calib_start_time,
-            safety_init_done
+            safety_init_done,
+            cmd_buf,
+            cmd_len
         ])]
     async fn state_manager(mut cx: state_manager::Context) {
         let mut ticks: u32 = 0;
 
         loop {
+            let current_state = cx.shared.state.lock(|s| *s);
+            // ── Check UART for incoming COBS-encoded commands (non-blocking) ──
+            // This runs BEFORE the state lock so we have access to local resources
+            // without nesting inside the lock closure.
+            let received_cmd: Option<Command> = if current_state != STATE::BOOT {
+                let cmd_buf = &mut *cx.local.cmd_buf;
+                let cmd_len = &mut *cx.local.cmd_len;
+                cx.shared.rx.lock(|rx| {
+                    loop {
+                        match rx.read() {
+                            Ok(b) => {
+                                if b == 0x00 {
+                                    if *cmd_len > 0 {
+                                        if let Ok(cmd) = postcard::from_bytes_cobs::<Command>(
+                                            &mut cmd_buf[..*cmd_len],
+                                        ) {
+                                            *cmd_len = 0;
+                                            return Some(cmd);
+                                        }
+                                        *cmd_len = 0;
+                                    }
+                                } else if *cmd_len < cmd_buf.len() {
+                                    cmd_buf[*cmd_len] = b;
+                                    *cmd_len += 1;
+                                } else {
+                                    *cmd_len = 0;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+
+            // ── State machine ──
             cx.shared.state.lock(|state| {
                 match *state {
                     STATE::BOOT => {
@@ -151,7 +196,7 @@ mod app {
                             *cx.local.safety_init_done = true;
                         }
 
-                        // Step 3: enable data stream, ensure it's being sent (uart for now, the server henceforth. perhaps file?)
+                        // Send HELLO to ESP32 for handshake
                         cx.shared.tx.lock(|tx| {
                             writeln!(tx, "HELLO\r").ok();
                         });
@@ -173,41 +218,76 @@ mod app {
                         });
 
                         if got_ok {
-                            defmt::info!("Handshake OK — proceeding to CALIBRATE");
+                            defmt::info!("Handshake OK — waiting for Start command");
                             cx.shared.ld3.lock(|ld3| ld3.set_low());
-                            cx.shared.ld2.lock(|ld2| ld2.set_high());
+                            cx.shared.ld2.lock(|ld2| ld2.set_high()); // yellow = idle/waiting
                             cx.shared.motor_pwm.lock(|motor| {
                                 let max_duty = motor.get_max_duty();
-                                motor.set_duty(max_duty);
+                                motor.set_duty(max_duty); // motor OFF
                             });
-                            cx.shared.relay.lock(|relay| relay.set_high());
-                            *state = STATE::CALIBRATE;
+                            // Do NOT enable relay — wait for Start command
+                            *state = STATE::IDLE;
                             ticks = 0;
                         } else {
                             // Still waiting — blink red LED
                             cx.shared.ld3.lock(|ld3| ld3.toggle());
                             defmt::info!("Waiting for ESP32 handshake...");
-                            // stay in BOOT, loop will retry in 10ms
                         }
                         ticks = 0;
+                    }
+
+                    STATE::IDLE => {
+                        // Motor stays OFF
+                        cx.shared.motor_pwm.lock(|motor| {
+                            let max = motor.get_max_duty();
+                            motor.set_duty(max);
+                        });
+
+                        // Blink yellow = waiting for Start command
+                        if ticks % 50 == 0 {
+                            cx.shared.ld2.lock(|ld2| ld2.toggle());
+                        }
+
+                        // Check for Start command from desktop app
+                        if let Some(Command::Start) = received_cmd {
+                            defmt::info!("START received — beginning calibration");
+                            cx.shared.ld2.lock(|ld2| ld2.set_low());
+                            cx.shared.ld1.lock(|ld1| ld1.set_high()); // green = running
+                            cx.shared.relay.lock(|relay| relay.set_high()); // power on
+                            *state = STATE::CALIBRATE;
+                            ticks = 0;
+                        }
                     }
 
                     STATE::CALIBRATE => {
                         let elapsed_ms = ticks * 10;
 
+                        // Check for Stop command during calibration
+                        if let Some(Command::Stop) = received_cmd {
+                            defmt::info!("STOP received — aborting calibration");
+                            cx.shared.motor_pwm.lock(|motor| {
+                                let max_duty = motor.get_max_duty();
+                                motor.set_duty(max_duty as u16); // motor OFF
+                            });
+                            cx.shared.relay.lock(|r| r.set_low()); // power off
+                            cx.shared.ld1.lock(|l| l.set_low());
+                            cx.shared.ld2.lock(|l| l.set_high()); // yellow = idle
+                            *state = STATE::IDLE;
+                            ticks = 0;
+                            return;
+                        }
+
                         cx.shared.motor_pwm.lock(|motor| {
                             let max_duty = motor.get_max_duty() as f32;
 
-                            // CHANGE 1: Bump Target to 50% or 100% so it definitely moves
                             let target_speed_percent = 1.0; // 100% Speed
 
                             // --- PHASE 1: RAMP UP (0s -> 5s) ---
                             if elapsed_ms < 5000 {
-                                // Progress: 0.0 -> 1.0
                                 let progress = elapsed_ms as f32 / 5000.0;
                                 let desired_speed = progress * target_speed_percent;
 
-                                // INVERTED MATH (The Magic):
+                                // INVERTED MATH:
                                 // Real Speed 0%   = Duty MAX
                                 // Real Speed 100% = Duty 0
                                 let inverted_duty = max_duty - (max_duty * desired_speed);
@@ -219,7 +299,6 @@ mod app {
                             }
                             // --- PHASE 2: HOLD (5s -> 10s) ---
                             else if elapsed_ms < 10000 {
-                                // Hold steady at Target Speed
                                 let desired_speed = target_speed_percent;
 
                                 let inverted_duty = max_duty - (max_duty * desired_speed);
@@ -229,7 +308,6 @@ mod app {
                             }
                             // --- PHASE 3: RAMP DOWN (10s -> 15s) ---
                             else if elapsed_ms < 15000 {
-                                // Ramp down from Target to 0%
                                 let ramp_down_progress = (elapsed_ms - 10000) as f32 / 5000.0;
                                 let desired_speed =
                                     target_speed_percent * (1.0 - ramp_down_progress);
@@ -250,27 +328,16 @@ mod app {
                                 cx.shared.relay.lock(|r| r.set_low());
 
                                 *state = STATE::IDLE;
-                                defmt::info!("Calibration Complete. Motor & Relay OFF.");
+                                defmt::info!(
+                                    "Calibration Complete. Motor & Relay OFF. Returning to IDLE."
+                                );
 
-                                cx.shared.relay.lock(|r| r.set_low());
-
-                                cx.shared.ld2.lock(|l| l.set_low());
-                                cx.shared.ld1.lock(|l| l.set_high());
+                                cx.shared.ld1.lock(|l| l.set_low());
+                                cx.shared.ld2.lock(|l| l.set_high()); // yellow = idle again
                             }
                         });
                     }
 
-                    STATE::IDLE => {
-                        cx.shared.motor_pwm.lock(|motor| {
-                            let max = motor.get_max_duty();
-                            // Inverted: Max Duty = STOP
-                            motor.set_duty(max);
-                        });
-
-                        if ticks % 100 == 0 {
-                            cx.shared.ld3.lock(|ld3| ld3.toggle());
-                        }
-                    }
                     _ => {}
                 }
             });
@@ -335,83 +402,4 @@ mod app {
             loop_counter = loop_counter.wrapping_add(1);
         }
     }
-    // 1 Hz: LD1
-    // #[task(shared = [ld1])]
-    // async fn blink_ld1(mut cx: blink_ld1::Context) {
-    //     cx.shared.ld1.lock(|p| p.toggle());
-    //     Mono::delay(1.secs()).await;
-    // }
-
-    // // 2 Hz: LD2
-    // #[task(shared = [ld2])]
-    // async fn blink_ld2(mut cx: blink_ld2::Context) {
-    //     cx.shared.ld2.lock(|p| p.toggle());
-    //     Mono::delay(500.millis()).await;
-    // }
-
-    // // A mini “light show” to show spawn_at accuracy
-    // // #[task]
-    // // async fn sequence_demo(_: sequence_demo::Context) {
-    // //     let t0 = Mono::now();
-    // //     step_ld3::spawn_at(t0).ok(); // t0
-    // //     step_ld1::spawn_at(t0 + 100.millis()).ok(); // t0 + 100ms
-    // //     step_ld2::spawn_at(t0 + 200.millis()).ok(); // t0 + 200ms
-    // //     all_off::spawn_at(t0 + 400.millis()).ok(); // t0 + 400ms
-    // // }
-
-    // #[task(shared = [ld3])]
-    // async fn step_ld3(mut cx: step_ld3::Context) {
-    //     cx.shared.ld3.lock(|p| p.set_high());
-    // }
-    // #[task(shared = [ld1])]
-    // async fn step_ld1(mut cx: step_ld1::Context) {
-    //     cx.shared.ld1.lock(|p| p.set_high());
-    // }
-    // #[task(shared = [ld2])]
-    // async fn step_ld2(mut cx: step_ld2::Context) {
-    //     cx.shared.ld2.lock(|p| p.set_high());
-    // }
-
-    // #[task(shared = [ld1, ld2, ld3])]
-    // async fn all_off(mut cx: all_off::Context) {
-    //     cx.shared.ld1.lock(|p| p.set_low());
-    //     cx.shared.ld2.lock(|p| p.set_low());
-    //     cx.shared.ld3.lock(|p| p.set_low());
-    // }
 }
-
-/*
-    stm32 focuses on controlling the system, deffering the data collected to the esp32
-    inputs{
-        voltage output of load cell
-            amperage
-            hence power output (watts)
-        rpm of dc motor
-
-
-    }
-    outputs{
-        pwm control for the dc motor
-        data packets to the esp32 for data processing
-            esp32 simply collects the data and focuses on outputting that data in real time to our webserver
-    }
-
-    overarching states{
-        init:
-            set up inputs
-            set up outputs
-        ready:
-            systems are nominal
-        startup:
-            spin up the dc motor, ensuring the rpm is being read properly
-        idle:
-            maintaining rpm/voltage output
-        wind down:
-
-        e stop:
-            vfd for braking?
-    }
-    tasks:
-
-
-*/
