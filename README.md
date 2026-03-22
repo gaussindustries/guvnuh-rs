@@ -1,6 +1,8 @@
 # Guv'nuh – Resilient Micro-Grid Control Platform
 
-![Guv'nuh Alpha Preview](githubMedia/Guv_Alpha_Preview.png)
+![Guv'nuh Alpha Preview](githubMedia/HQ_Still_Preview_Alpha.png)
+
+![Guv'nuh Live Demo](githubMedia/preview_v6.gif)
 
 A laboratory-scale governor architecture that converts a standard DC motor into a
 **secure, programmable micro-generator testbed**. This platform demonstrates a
@@ -28,7 +30,7 @@ with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 | **F-03** | Load Rejection Response | Recovery < 2s (100% → 0% Load Step) | 🔄 In Progress |
 | **F-04** | "Apollo 9" Boot Handshake | Machine locked until Cloud Authorization | ✅ Complete |
 | **F-05** | Telemetry Segregation | "Air-gapped" UART Link | ✅ Complete |
-| **F-06** | Intranet Telemetry Stream | Live RPM over TCP/WiFi | ✅ Complete |
+| **F-06** | Intranet Telemetry Stream | Live Telemetry over TCP/WiFi | ✅ Complete |
 | **F-07** | Desktop Trial Control | Start/Stop from Dioxus Desktop App | ✅ Complete |
 | **F-08** | Trial Run Recording | Per-trial telemetry to SurrealDB | ✅ Complete |
 | **F-09** | Telemetry Visualization | Plotly.js time-series with metric toggles | ✅ Complete |
@@ -76,12 +78,12 @@ changes, only physical plant reconfiguration.
 └───────────────────────────────────────────────────────┼──────┘
                                                         │ UART
 ┌───────────────────────────────────────────────────────┼──────┐
-│                    TELEMETRY DOMAIN                    │      │
-│                                                       ▼      │
+│                    TELEMETRY DOMAIN                   │      │
+│                                                       ▼     │
 │   ESP32-WROOM ◄──── UART RX (GPIO16)                        │
 │       ├── Handshake Manager                                  │
 │       ├── WiFi (esp-wifi + embassy-net)                      │
-│       ├── TCP Server :3000 (bidirectional) ──────────────►   │
+│       ├── TCP Server :3000 (bidirectional) ──────────────►  │
 │       └── CMD forwarding (TCP → UART → STM32)                │
 └──────────────────────────────────────────────────────────────┘
                                           │ TCP/WiFi
