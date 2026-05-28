@@ -28,7 +28,7 @@ with secure cloud telemetry (Rust/Dioxus/SurrealDB).
 | **F-01** | Closed-loop speed regulation | ±2% droop, 0–1 kW range | 🔄 In Progress |
 | **F-02** | Overspeed trip to safe torque-off | < 12 ms (Hardware Interrupt) | 🔄 In Progress |
 | **F-03** | Load Rejection Response | Recovery < 2s (100% → 0% Load Step) | 🔄 In Progress |
-| **F-04** | "Apollo 9" Boot Handshake | Machine locked until Cloud Authorization | ✅ Complete |
+| **F-04** | Async Boot MCU Handshake | Machine locked until Cloud Authorization | ✅ Complete |
 | **F-05** | Telemetry Segregation | "Air-gapped" UART Link | ✅ Complete |
 | **F-06** | Intranet Telemetry Stream | Live Telemetry over TCP/WiFi | ✅ Complete |
 | **F-07** | Desktop Trial Control | Start/Stop from Dioxus Desktop App | ✅ Complete |
@@ -321,7 +321,7 @@ SURREAL_USER=root
 SURREAL_PASS=root
 SURREAL_NS=gaussindustries
 SURREAL_DB=main
-ESP32_ADDR=192.168.1.6:3000
+ESP32_ADDR=192.168.1.189:3000
 ```
 
 ### Run

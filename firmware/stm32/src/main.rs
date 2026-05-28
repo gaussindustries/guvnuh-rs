@@ -4,10 +4,9 @@
 
 defmt::timestamp!("{=u64:us}", { 0 });
 
-// Imports
 use core::fmt::Write;
-use defmt_rtt as _; // link defmt logger
-use panic_probe as _; // link panic handler
+use defmt_rtt as _;
+use panic_probe as _;
 
 use rtic::app;
 use rtic_monotonics::fugit::ExtU32;
@@ -22,82 +21,78 @@ use stm32h7xx_hal::{
 
 use cortex_m::peripheral::scb::SystemHandler;
 
-// Internal Modules
 mod guv;
 mod models;
-// Shared Librarys (for esp32/stm32)
+
 use crate::models::status::WorkerStatus;
 use nb::block;
-use shared::models::state::states::STATE;
-use shared::models::telemetry::telemetry::Command;
-// Create a SysTick-based monotonic named `Mono` that ticks at 1 kHz
+use shared::models::state::states::{Fault, STATE};
+use shared::models::telemetry::telemetry::{Command, LiveParam, PidGains, RunConfig, RunMode};
+
 systick_monotonic!(Mono, 1_000);
 
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
-    use stm32h7xx_hal::qei::Qei;
-
     use super::*;
-
+    use stm32h7xx_hal::qei::Qei;
+    type Motor = crate::guv::motor::MotorController;
+    type Cfg = Option<RunConfig>;
     #[shared]
     pub struct Shared {
-        //core GPIO
+        // GPIO
         ld1: gpio::Pin<'B', 0, Output<PushPull>>,  // green
-        ld2: gpio::Pin<'E', 1, Output<PushPull>>,  // orange/yellur
+        ld2: gpio::Pin<'E', 1, Output<PushPull>>,  // yellow
         ld3: gpio::Pin<'B', 14, Output<PushPull>>, // red
-
         relay: gpio::Pin<'E', 0, Output<PushPull>>,
 
-        motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
+        // Motor (wraps inverted PWM logic)
+        motor: crate::guv::motor::MotorController,
 
+        // Encoder
         encoder: Qei<TIM2>,
 
+        // UART to ESP32
         tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::pac::UART4>,
         rx: stm32h7xx_hal::serial::Rx<stm32h7xx_hal::pac::UART4>,
 
-        //funcs (funk)
-
-        //structs
+        // State
         pub state: STATE,
+        pub run_config: Option<RunConfig>,
+        pub current_rpm: f32,
+        pub last_fault: Option<Fault>,
     }
 
     #[local]
     pub struct Local {
-        calib_start_time: Option<u32>,
         safety_init_done: bool,
-        cmd_buf: [u8; 64], // COBS accumulation buffer for incoming commands
-        cmd_len: usize,    // current position in cmd_buf
+        cmd_buf: [u8; 128],
+        cmd_len: usize,
+        pid: crate::guv::pid::PidController,
+        ramp: Option<crate::guv::ramp::Ramp>,
+        run_elapsed_ms: u32,
     }
 
-    // --- THE INIT WRAPPER ---
     #[init]
     fn init(mut cx: init::Context) -> (Shared, Local) {
         defmt::info!("System Boot: Initializing...");
 
-        // 1. DELEGATE TO BOOT.RS
         let mut board = crate::guv::states::boot::setup(cx.device);
 
         unsafe {
             cx.core.SCB.set_priority(SystemHandler::SysTick, 255);
         }
 
-        // --- SAFETY: ENSURE MOTOR IS OFF ON BOOT ---
-        // Inverted Logic: Set Duty to MAX to turn motor OFF.
-        let max_duty = board.motor_pwm.get_max_duty();
-        board.motor_pwm.set_duty(max_duty);
+        // Wrap PWM in MotorController — constructor forces motor off
+        let motor = crate::guv::motor::MotorController::new(board.motor_pwm);
 
-        // 2. START SCHEDULER
         let sys_freq = board.clocks.sysclk().to_Hz();
         Mono::start(cx.core.SYST, sys_freq);
 
-        // 3. SPAWN MANAGER
         state_manager::spawn().ok();
-
         rpm_monitor::spawn().ok();
 
-        board.ld3.set_high(); // Red LED on
+        board.ld3.set_high(); // Red = booting
 
-        // 4. RETURN RESOURCES
         (
             Shared {
                 state: STATE::BOOT,
@@ -105,68 +100,61 @@ mod app {
                 ld2: board.ld2,
                 ld3: board.ld3,
                 relay: board.relay,
-                motor_pwm: board.motor_pwm,
+                motor,
                 encoder: board.encoder,
                 tx: board.tx,
                 rx: board.rx,
+                run_config: None,
+                current_rpm: 0.0,
+                last_fault: None,
             },
             Local {
-                calib_start_time: None,
                 safety_init_done: false,
-                cmd_buf: [0u8; 64],
+                cmd_buf: [0u8; 128],
                 cmd_len: 0,
+                pid: crate::guv::pid::PidController::new(PidGains::default()),
+                ramp: None,
+                run_elapsed_ms: 0,
             },
         )
     }
 
-    // --- THE CEO (State Manager) ---
+    // ────────────────────────────────────────────
+    //  State Manager — the main control loop
+    // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [
-            state,
-            ld1,
-            ld2,
-            ld3,
-            relay,
-            motor_pwm,
-            tx,
-            rx
-        ],
-        local = [
-            calib_start_time,
-            safety_init_done,
-            cmd_buf,
-            cmd_len
-        ])]
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault],
+        local = [safety_init_done, cmd_buf, cmd_len, pid, ramp, run_elapsed_ms]
+    )]
     async fn state_manager(mut cx: state_manager::Context) {
-        let mut ticks: u32 = 0;
+        let dt_ms: u32 = 10;
 
         loop {
+            // ── Read incoming COBS command (non-blocking) ──
             let current_state = cx.shared.state.lock(|s| *s);
-            // ── Check UART for incoming COBS-encoded commands (non-blocking) ──
-            // This runs BEFORE the state lock so we have access to local resources
-            // without nesting inside the lock closure.
+
             let received_cmd: Option<Command> = if current_state != STATE::BOOT {
-                let cmd_buf = &mut *cx.local.cmd_buf;
-                let cmd_len = &mut *cx.local.cmd_len;
+                let buf = &mut *cx.local.cmd_buf;
+                let len = &mut *cx.local.cmd_len;
                 cx.shared.rx.lock(|rx| {
                     loop {
                         match rx.read() {
                             Ok(b) => {
                                 if b == 0x00 {
-                                    if *cmd_len > 0 {
-                                        if let Ok(cmd) = postcard::from_bytes_cobs::<Command>(
-                                            &mut cmd_buf[..*cmd_len],
-                                        ) {
-                                            *cmd_len = 0;
+                                    if *len > 0 {
+                                        if let Ok(cmd) =
+                                            postcard::from_bytes_cobs::<Command>(&mut buf[..*len])
+                                        {
+                                            *len = 0;
                                             return Some(cmd);
                                         }
-                                        *cmd_len = 0;
+                                        *len = 0;
                                     }
-                                } else if *cmd_len < cmd_buf.len() {
-                                    cmd_buf[*cmd_len] = b;
-                                    *cmd_len += 1;
+                                } else if *len < buf.len() {
+                                    buf[*len] = b;
+                                    *len += 1;
                                 } else {
-                                    *cmd_len = 0;
+                                    *len = 0;
                                 }
                             }
                             Err(_) => break,
@@ -178,176 +166,711 @@ mod app {
                 None
             };
 
+            // ── ESTOP — always honored, any state ──
+            if let Some(Command::EmergencyStop) = received_cmd {
+                defmt::warn!("!! EMERGENCY STOP !!");
+                cx.shared.motor.lock(|m| m.force_off());
+                cx.shared.relay.lock(|r| r.set_low());
+                cx.shared.state.lock(|s| *s = STATE::ESTOP);
+                cx.local.pid.reset();
+                *cx.local.ramp = None;
+                *cx.local.run_elapsed_ms = 0;
+                cx.shared.ld1.lock(|l| l.set_low());
+                cx.shared.ld2.lock(|l| l.set_low());
+                cx.shared.ld3.lock(|l| l.set_high()); // red solid
+                Mono::delay(dt_ms.millis()).await;
+                continue;
+            }
+
             // ── State machine ──
-            cx.shared.state.lock(|state| {
-                match *state {
-                    STATE::BOOT => {
-                        defmt::info!("StateMachine: BOOT");
-
-                        // SAFETY SEQUENCE:
-                        // Step 1: Assert 0% speed (Max Duty for inverted logic)
-                        if !*cx.local.safety_init_done {
-                            cx.shared.motor_pwm.lock(|motor| {
-                                let max_duty = motor.get_max_duty();
-                                motor.set_duty(max_duty);
-                            });
-                            cx.shared.relay.lock(|relay| relay.set_low());
-                            defmt::info!("Safety init complete.");
-                            *cx.local.safety_init_done = true;
-                        }
-
-                        // Send HELLO to ESP32 for handshake
-                        cx.shared.tx.lock(|tx| {
-                            writeln!(tx, "HELLO\r").ok();
-                        });
-
-                        // Try to read OK response (non-blocking)
-                        let got_ok = cx.shared.rx.lock(|rx| {
-                            let mut buf = [0u8; 4];
-                            let mut i = 0;
-                            while i < 4 {
-                                match rx.read() {
-                                    Ok(b) => {
-                                        buf[i] = b;
-                                        i += 1;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            &buf[..i] == b"OK\r\n" || &buf[..i] == b"OK\r"
-                        });
-
-                        if got_ok {
-                            defmt::info!("Handshake OK — waiting for Start command");
-                            cx.shared.ld3.lock(|ld3| ld3.set_low());
-                            cx.shared.ld2.lock(|ld2| ld2.set_high()); // yellow = idle/waiting
-                            cx.shared.motor_pwm.lock(|motor| {
-                                let max_duty = motor.get_max_duty();
-                                motor.set_duty(max_duty); // motor OFF
-                            });
-                            // Do NOT enable relay — wait for Start command
-                            *state = STATE::IDLE;
-                            ticks = 0;
-                        } else {
-                            // Still waiting — blink red LED
-                            cx.shared.ld3.lock(|ld3| ld3.toggle());
-                            defmt::info!("Waiting for ESP32 handshake...");
-                        }
-                        ticks = 0;
+            match current_state {
+                // ─── BOOT: safety init + ESP32 handshake ───
+                STATE::BOOT => {
+                    if !*cx.local.safety_init_done {
+                        cx.shared.motor.lock(|m| m.force_off());
+                        cx.shared.relay.lock(|r| r.set_low());
+                        defmt::info!("Safety init complete.");
+                        *cx.local.safety_init_done = true;
                     }
 
-                    STATE::IDLE => {
-                        // Motor stays OFF
-                        cx.shared.motor_pwm.lock(|motor| {
-                            let max = motor.get_max_duty();
-                            motor.set_duty(max);
-                        });
+                    cx.shared.tx.lock(|tx| {
+                        writeln!(tx, "HELLO\r").ok();
+                    });
 
-                        // Blink yellow = waiting for Start command
-                        if ticks % 50 == 0 {
-                            cx.shared.ld2.lock(|ld2| ld2.toggle());
-                        }
-
-                        // Check for Start command from desktop app
-                        if let Some(Command::Start) = received_cmd {
-                            defmt::info!("START received — beginning calibration");
-                            cx.shared.ld2.lock(|ld2| ld2.set_low());
-                            cx.shared.ld1.lock(|ld1| ld1.set_high()); // green = running
-                            cx.shared.relay.lock(|relay| relay.set_high()); // power on
-                            *state = STATE::CALIBRATE;
-                            ticks = 0;
-                        }
-                    }
-
-                    STATE::CALIBRATE => {
-                        let elapsed_ms = ticks * 10;
-
-                        // Check for Stop command during calibration
-                        if let Some(Command::Stop) = received_cmd {
-                            defmt::info!("STOP received — aborting calibration");
-                            cx.shared.motor_pwm.lock(|motor| {
-                                let max_duty = motor.get_max_duty();
-                                motor.set_duty(max_duty as u16); // motor OFF
-                            });
-                            cx.shared.relay.lock(|r| r.set_low()); // power off
-                            cx.shared.ld1.lock(|l| l.set_low());
-                            cx.shared.ld2.lock(|l| l.set_high()); // yellow = idle
-                            *state = STATE::IDLE;
-                            ticks = 0;
-                            return;
-                        }
-
-                        cx.shared.motor_pwm.lock(|motor| {
-                            let max_duty = motor.get_max_duty() as f32;
-
-                            let target_speed_percent = 1.0; // 100% Speed
-
-                            // --- PHASE 1: RAMP UP (0s -> 5s) ---
-                            if elapsed_ms < 5000 {
-                                let progress = elapsed_ms as f32 / 5000.0;
-                                let desired_speed = progress * target_speed_percent;
-
-                                // INVERTED MATH:
-                                // Real Speed 0%   = Duty MAX
-                                // Real Speed 100% = Duty 0
-                                let inverted_duty = max_duty - (max_duty * desired_speed);
-                                motor.set_duty(inverted_duty as u16);
-
-                                if ticks % 10 == 0 {
-                                    cx.shared.ld1.lock(|l| l.toggle());
+                    let got_ok = cx.shared.rx.lock(|rx| {
+                        let mut buf = [0u8; 4];
+                        let mut i = 0;
+                        while i < 4 {
+                            match rx.read() {
+                                Ok(b) => {
+                                    buf[i] = b;
+                                    i += 1;
                                 }
+                                Err(_) => break,
                             }
-                            // --- PHASE 2: HOLD (5s -> 10s) ---
-                            else if elapsed_ms < 10000 {
-                                let desired_speed = target_speed_percent;
+                        }
+                        &buf[..i] == b"OK\r\n" || &buf[..i] == b"OK\r"
+                    });
 
-                                let inverted_duty = max_duty - (max_duty * desired_speed);
-                                motor.set_duty(inverted_duty as u16);
-
-                                cx.shared.ld1.lock(|l| l.set_high());
-                            }
-                            // --- PHASE 3: RAMP DOWN (10s -> 15s) ---
-                            else if elapsed_ms < 15000 {
-                                let ramp_down_progress = (elapsed_ms - 10000) as f32 / 5000.0;
-                                let desired_speed =
-                                    target_speed_percent * (1.0 - ramp_down_progress);
-
-                                let inverted_duty = max_duty - (max_duty * desired_speed);
-                                motor.set_duty(inverted_duty as u16);
-
-                                if ticks % 20 == 0 {
-                                    cx.shared.ld1.lock(|l| l.toggle());
-                                }
-                            }
-                            // --- FINISHED ---
-                            else {
-                                // Force STOP (Inverted: Max Duty)
-                                motor.set_duty(max_duty as u16);
-
-                                // SAFETY: Shut off power to the controller
-                                cx.shared.relay.lock(|r| r.set_low());
-
-                                *state = STATE::IDLE;
-                                defmt::info!(
-                                    "Calibration Complete. Motor & Relay OFF. Returning to IDLE."
-                                );
-
-                                cx.shared.ld1.lock(|l| l.set_low());
-                                cx.shared.ld2.lock(|l| l.set_high()); // yellow = idle again
-                            }
-                        });
+                    if got_ok {
+                        defmt::info!("Handshake OK — entering IDLE");
+                        cx.shared.ld3.lock(|l| l.set_low());
+                        cx.shared.ld2.lock(|l| l.set_high());
+                        cx.shared.state.lock(|s| *s = STATE::IDLE);
+                    } else {
+                        cx.shared.ld3.lock(|l| l.toggle());
                     }
-
-                    _ => {}
                 }
-            });
 
-            Mono::delay(10u32.millis()).await;
-            ticks += 1;
+                // ─── IDLE: motor off, waiting for Configure ───
+                STATE::IDLE => {
+                    cx.shared.motor.lock(|m| m.disable());
+
+                    match received_cmd {
+                        Some(Command::Configure(config)) => {
+                            defmt::info!(
+                                "Config received: mode={} target_rpm={}",
+                                match config.mode {
+                                    RunMode::OpenLoop => "OpenLoop",
+                                    RunMode::ClosedLoop => "ClosedLoop",
+                                    RunMode::Calibrate => "Calibrate",
+                                    RunMode::Manual => "Manual",
+                                    RunMode::Generate => "Generate",
+                                },
+                                config.target_rpm as i32
+                            );
+                            cx.shared
+                                .motor
+                                .lock(|m| m.set_duty_clamp(config.max_duty_clamp));
+                            cx.shared.run_config.lock(|rc| *rc = Some(config));
+                            cx.shared.last_fault.lock(|f| *f = None);
+                            cx.shared.state.lock(|s| *s = STATE::CONFIGURED);
+                            // Green solid = configured
+                            cx.shared.ld2.lock(|l| l.set_low());
+                            cx.shared.ld1.lock(|l| l.set_high());
+                        }
+                        Some(Command::ClearFaults) => {
+                            cx.shared.last_fault.lock(|f| *f = None);
+                            defmt::info!("Faults cleared");
+                        }
+                        _ => {
+                            // Slow yellow blink = idle
+                            static mut IDLE_TICK: u32 = 0;
+                            unsafe {
+                                IDLE_TICK += 1;
+                            }
+                            if unsafe { IDLE_TICK } % 50 == 0 {
+                                cx.shared.ld2.lock(|l| l.toggle());
+                            }
+                        }
+                    }
+                }
+
+                // ─── CONFIGURED: RunConfig loaded, waiting for Start ───
+                STATE::CONFIGURED => {
+                    match received_cmd {
+                        Some(Command::Start) => {
+                            let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+                            defmt::info!(
+                                "START — mode={}",
+                                match config.mode {
+                                    RunMode::OpenLoop => "OpenLoop",
+                                    RunMode::ClosedLoop => "ClosedLoop",
+                                    RunMode::Calibrate => "Calibrate",
+                                    RunMode::Manual => "Manual",
+                                    RunMode::Generate => "Generate",
+                                }
+                            );
+
+                            // Power on
+                            cx.shared.relay.lock(|r| r.set_high());
+                            cx.shared.motor.lock(|m| m.enable());
+                            cx.local.pid.reset();
+                            *cx.local.run_elapsed_ms = 0;
+
+                            // Set up ramp for non-manual modes
+                            if config.mode != RunMode::Manual {
+                                *cx.local.ramp =
+                                    Some(crate::guv::ramp::Ramp::new(0.0, 1.0, config.ramp_up_ms));
+                            } else {
+                                *cx.local.ramp = None;
+                            }
+
+                            if config.mode == RunMode::ClosedLoop
+                                || config.mode == RunMode::Generate
+                            {
+                                cx.local.pid.set_gains(config.pid);
+                            }
+
+                            let next = match config.mode {
+                                RunMode::Calibrate => STATE::CALIBRATE,
+                                RunMode::Manual => STATE::MANUAL,
+                                RunMode::Generate => STATE::SPOOLUP,
+                                _ => STATE::SPOOLUP, // OpenLoop and ClosedLoop also spool up
+                            };
+                            cx.shared.state.lock(|s| *s = next);
+                        }
+                        Some(Command::Configure(config)) => {
+                            // Allow reconfiguration before Start
+                            defmt::info!("Reconfigure received");
+                            cx.shared
+                                .motor
+                                .lock(|m| m.set_duty_clamp(config.max_duty_clamp));
+                            cx.shared.run_config.lock(|rc| *rc = Some(config));
+                        }
+                        Some(Command::Stop) => {
+                            defmt::info!("Stop in CONFIGURED — back to IDLE");
+                            cx.shared.run_config.lock(|rc| *rc = None);
+                            cx.shared.state.lock(|s| *s = STATE::IDLE);
+                            cx.shared.ld1.lock(|l| l.set_low());
+                            cx.shared.ld2.lock(|l| l.set_high());
+                        }
+                        _ => {
+                            // Steady green = ready
+                            cx.shared.ld1.lock(|l| l.set_high());
+                        }
+                    }
+                }
+
+                // ─── CALIBRATE: simple motor test sequence ───
+                STATE::CALIBRATE => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+                    *cx.local.run_elapsed_ms += dt_ms;
+                    let elapsed = *cx.local.run_elapsed_ms;
+
+                    if let Some(Command::Stop) = received_cmd {
+                        defmt::info!("STOP during calibration");
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // Phase 1: ramp up
+                    if elapsed < config.ramp_up_ms {
+                        let progress = elapsed as f32 / config.ramp_up_ms as f32;
+                        cx.shared.motor.lock(|m| m.set_speed(progress));
+                        if (elapsed / 100) % 2 == 0 {
+                            cx.shared.ld1.lock(|l| l.toggle());
+                        }
+                    }
+                    // Phase 2: hold
+                    else if config.hold_ms == 0 || elapsed < config.ramp_up_ms + config.hold_ms {
+                        cx.shared.motor.lock(|m| m.set_speed(1.0));
+                        cx.shared.ld1.lock(|l| l.set_high());
+
+                        // If hold_ms == 0, hold indefinitely (until Stop)
+                        if config.hold_ms == 0 {
+                            // just hold
+                        }
+                    }
+                    // Phase 3: ramp down
+                    else if elapsed < config.ramp_up_ms + config.hold_ms + config.ramp_down_ms {
+                        let rd_elapsed = elapsed - config.ramp_up_ms - config.hold_ms;
+                        let progress = 1.0 - (rd_elapsed as f32 / config.ramp_down_ms as f32);
+                        cx.shared.motor.lock(|m| m.set_speed(progress));
+                        if (elapsed / 200) % 2 == 0 {
+                            cx.shared.ld1.lock(|l| l.toggle());
+                        }
+                    }
+                    // Done
+                    else {
+                        defmt::info!("Calibration complete — IDLE");
+                        cx.shared.motor.lock(|m| m.disable());
+                        cx.shared.relay.lock(|r| r.set_low());
+                        *cx.local.run_elapsed_ms = 0;
+                        cx.shared.state.lock(|s| *s = STATE::IDLE);
+                        cx.shared.ld1.lock(|l| l.set_low());
+                        cx.shared.ld2.lock(|l| l.set_high());
+                    }
+                }
+
+                // ─── SPOOLUP: ramp motor to target RPM ───
+                STATE::SPOOLUP => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+                    *cx.local.run_elapsed_ms += dt_ms;
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // Apply live adjustments
+                    if let Some(Command::LiveAdjust(param)) = received_cmd {
+                        match param {
+                            LiveParam::Duty(d) => {
+                                cx.shared.motor.lock(
+                                    |m: &mut crate::guv::motor::MotorController| m.set_speed(d),
+                                );
+                            }
+                            LiveParam::TargetRpm(rpm) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_rpm = rpm;
+                                    }
+                                });
+                            }
+                            LiveParam::PidGains(gains) => {
+                                cx.local.pid.set_gains(gains);
+                            }
+                            LiveParam::MaxDutyClamp(clamp) => {
+                                cx.shared.motor.lock(
+                                    |m: &mut crate::guv::motor::MotorController| {
+                                        m.set_duty_clamp(clamp)
+                                    },
+                                );
+                            }
+                            LiveParam::TargetFreqHz(hz) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_freq_hz = hz;
+                                    }
+                                });
+                            }
+                            LiveParam::TargetVRms(v) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_v_rms = v;
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // Ramp up
+                    if let Some(ref mut ramp) = cx.local.ramp {
+                        let val = ramp.tick(dt_ms);
+                        match config.mode {
+                            RunMode::ClosedLoop | RunMode::Generate => {
+                                let target_rpm = config.target_rpm * val;
+                                let measured = cx.shared.current_rpm.lock(|r| *r);
+                                let dt_s = dt_ms as f32 / 1000.0;
+                                let output = cx.local.pid.update(target_rpm, measured, dt_s);
+                                cx.shared.motor.lock(|m| m.set_speed(output));
+                            }
+                            _ => {
+                                cx.shared.motor.lock(|m| m.set_speed(val));
+                            }
+                        }
+
+                        if ramp.is_done() {
+                            *cx.local.ramp = None;
+                            defmt::info!("Spoolup complete");
+
+                            // For Generate mode, advance through the sequence
+                            // For OpenLoop/ClosedLoop, stay in steady state here
+                            match config.mode {
+                                RunMode::Generate => {
+                                    cx.shared.state.lock(|s| *s = STATE::EXCITE);
+                                    defmt::info!("→ EXCITE");
+                                }
+                                _ => {
+                                    // OpenLoop/ClosedLoop: just hold at speed
+                                    // (stays in SPOOLUP as a "running" state)
+                                }
+                            }
+                        }
+                    } else {
+                        // Post-ramp steady state for OpenLoop/ClosedLoop
+                        match config.mode {
+                            RunMode::ClosedLoop => {
+                                let measured = cx.shared.current_rpm.lock(|r| *r);
+                                let dt_s = dt_ms as f32 / 1000.0;
+                                let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                                cx.shared.motor.lock(|m| m.set_speed(output));
+                            }
+                            _ => {
+                                // OpenLoop holds whatever duty the ramp ended at
+                            }
+                        }
+
+                        // Check hold timeout (0 = indefinite)
+                        if config.hold_ms > 0
+                            && *cx.local.run_elapsed_ms >= config.ramp_up_ms + config.hold_ms
+                        {
+                            defmt::info!("Hold complete — ramping down");
+                            let speed = cx.shared.motor.lock(|m| m.speed());
+                            *cx.local.ramp =
+                                Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                            cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        }
+                    }
+
+                    // LED: fast green blink during spoolup
+                    if (*cx.local.run_elapsed_ms / 100) % 2 == 0 {
+                        cx.shared.ld1.lock(|l| l.toggle());
+                    }
+                }
+
+                // ─── EXCITE: energize capacitor bank (stub for now) ───
+                STATE::EXCITE => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // TODO: monitor v_gen_rms from ADC
+                    // When voltage builds to target_v_rms, advance to PLL_LOCK
+                    // For now, auto-advance after 3 seconds as placeholder
+                    *cx.local.run_elapsed_ms += dt_ms;
+                    if *cx.local.run_elapsed_ms > config.ramp_up_ms + 3000 {
+                        defmt::info!("Excitation nominal → PLL_LOCK");
+                        cx.shared.state.lock(|s| *s = STATE::PLL_LOCK);
+                    }
+
+                    // LED: yellow fast blink
+                    cx.shared.ld2.lock(|l| l.toggle());
+                }
+
+                // ─── PLL_LOCK: phase-lock to reference (stub) ───
+                STATE::PLL_LOCK => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // TODO: phase detector + loop filter on theta_err_rad
+                    // When |theta_err| < threshold, advance to READY
+                    // Placeholder: auto-advance after 2 seconds
+                    *cx.local.run_elapsed_ms += dt_ms;
+                    if *cx.local.run_elapsed_ms > config.ramp_up_ms + 5000 {
+                        defmt::info!("PLL locked → READY");
+                        cx.shared.state.lock(|s| *s = STATE::READY);
+                        // One green blink to signal lock
+                        cx.shared.ld1.lock(|l| l.set_high());
+                    }
+
+                    // LED: yellow blink slowing as "lock" approaches
+                    let elapsed_in_pll = *cx.local.run_elapsed_ms - config.ramp_up_ms - 3000;
+                    let blink_rate = 50u32.saturating_sub(elapsed_in_pll / 100).max(5);
+                    if (elapsed_in_pll / 10) % blink_rate < blink_rate / 2 {
+                        cx.shared.ld2.lock(|l| l.set_high());
+                    } else {
+                        cx.shared.ld2.lock(|l| l.set_low());
+                    }
+                }
+
+                // ─── READY: locked, gate closed, waiting for load ───
+                STATE::READY => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // Maintain PID on RPM to hold speed
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+                    let dt_s = dt_ms as f32 / 1000.0;
+                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    cx.shared.motor.lock(|m| m.set_speed(output));
+
+                    // Apply live adjustments
+                    if let Some(Command::LiveAdjust(param)) = received_cmd {
+                        match param {
+                            LiveParam::Duty(d) => {
+                                cx.shared.motor.lock(
+                                    |m: &mut crate::guv::motor::MotorController| m.set_speed(d),
+                                );
+                            }
+                            LiveParam::TargetRpm(rpm) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_rpm = rpm;
+                                    }
+                                });
+                            }
+                            LiveParam::PidGains(gains) => {
+                                cx.local.pid.set_gains(gains);
+                            }
+                            LiveParam::MaxDutyClamp(clamp) => {
+                                cx.shared.motor.lock(
+                                    |m: &mut crate::guv::motor::MotorController| {
+                                        m.set_duty_clamp(clamp)
+                                    },
+                                );
+                            }
+                            LiveParam::TargetFreqHz(hz) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_freq_hz = hz;
+                                    }
+                                });
+                            }
+                            LiveParam::TargetVRms(v) => {
+                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_v_rms = v;
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // TODO: auto-transition to GENERATE when load is connected
+                    // or when desktop sends a "gate open" command
+                    // For now, desktop sends Start again to open gate (reuse command)
+                    if let Some(Command::Start) = received_cmd {
+                        defmt::info!("Gate open → GENERATE");
+                        cx.shared.state.lock(|s| *s = STATE::GENERATE);
+                    }
+
+                    // LED: steady green
+                    cx.shared.ld1.lock(|l| l.set_high());
+                    cx.shared.ld2.lock(|l| l.set_low());
+                }
+
+                // ─── GENERATE: serving load ───
+                STATE::GENERATE => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // Closed-loop RPM/frequency regulation
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+                    let dt_s = dt_ms as f32 / 1000.0;
+                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    cx.shared.motor.lock(|m| m.set_speed(output));
+
+                    // Apply live adjustments
+                    if let Some(Command::LiveAdjust(param)) = received_cmd {
+                        match param {
+                            LiveParam::Duty(d) => {
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
+                            }
+                            LiveParam::TargetRpm(rpm) => {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_rpm = rpm;
+                                    }
+                                });
+                            }
+                            LiveParam::PidGains(gains) => {
+                                cx.local.pid.set_gains(gains);
+                            }
+                            LiveParam::MaxDutyClamp(clamp) => {
+                                cx.shared
+                                    .motor
+                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
+                            }
+                            LiveParam::TargetFreqHz(hz) => {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_freq_hz = hz;
+                                    }
+                                });
+                            }
+                            LiveParam::TargetVRms(v) => {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
+                                    if let Some(ref mut c) = rc {
+                                        c.target_v_rms = v;
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // TODO: detect load rejection (large delta in current/RPM)
+                    // If |rpm - target| > threshold, transition to LOAD_REJECTION
+
+                    // LED: steady green
+                    cx.shared.ld1.lock(|l| l.set_high());
+                }
+
+                // ─── LOAD_REJECTION: rapid load change recovery ───
+                STATE::LOAD_REJECTION => {
+                    let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+
+                    if let Some(Command::Stop) = received_cmd {
+                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        *cx.local.ramp =
+                            Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        Mono::delay(dt_ms.millis()).await;
+                        continue;
+                    }
+
+                    // Aggressive PID recovery — same controller, just let it work
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+                    let dt_s = dt_ms as f32 / 1000.0;
+                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    cx.shared.motor.lock(|m| m.set_speed(output));
+
+                    // TODO: when RPM stabilizes within tolerance, return to GENERATE
+                    let error = (config.target_rpm - measured).abs();
+                    if error < config.target_rpm * 0.02 {
+                        // Within 2% — recovered
+                        defmt::info!("Load rejection recovered → GENERATE");
+                        cx.shared.state.lock(|s| *s = STATE::GENERATE);
+                    }
+
+                    // LED: fast green/yellow alternating
+                    cx.shared.ld1.lock(|l| l.toggle());
+                    cx.shared.ld2.lock(|l| l.toggle());
+                }
+
+                // ─── MANUAL: live desktop control ───
+                STATE::MANUAL => {
+                    match received_cmd {
+                        Some(Command::LiveAdjust(LiveParam::Duty(d))) => {
+                            cx.shared.motor.lock(|m| m.set_speed(d));
+                        }
+                        Some(Command::LiveAdjust(LiveParam::MaxDutyClamp(c))) => {
+                            cx.shared.motor.lock(|m| m.set_duty_clamp(c));
+                        }
+                        Some(Command::LiveAdjust(LiveParam::TargetRpm(rpm))) => {
+                            // Switch to closed-loop on the fly
+                            cx.shared.run_config.lock(|rc| {
+                                if let Some(ref mut c) = rc {
+                                    c.target_rpm = rpm;
+                                }
+                            });
+                        }
+                        Some(Command::Stop) => {
+                            let speed = cx.shared.motor.lock(|m| m.speed());
+                            let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
+                            *cx.local.ramp =
+                                Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                            cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        }
+                        _ => {}
+                    }
+
+                    // LED: green slow blink = manual
+                    static mut MANUAL_TICK: u32 = 0;
+                    unsafe {
+                        MANUAL_TICK += 1;
+                    }
+                    if unsafe { MANUAL_TICK } % 25 == 0 {
+                        cx.shared.ld1.lock(|l| l.toggle());
+                    }
+                }
+
+                // ─── RAMP_DOWN: graceful shutdown ───
+                STATE::RAMP_DOWN => {
+                    if let Some(ref mut ramp) = cx.local.ramp {
+                        let val = ramp.tick(dt_ms);
+                        cx.shared.motor.lock(|m| m.set_speed(val));
+
+                        if ramp.is_done() {
+                            defmt::info!("Ramp down complete → IDLE");
+                            cx.shared.motor.lock(|m| m.disable());
+                            cx.shared.relay.lock(|r| r.set_low());
+                            *cx.local.ramp = None;
+                            *cx.local.run_elapsed_ms = 0;
+                            cx.shared.state.lock(|s| *s = STATE::IDLE);
+                            cx.shared.ld1.lock(|l| l.set_low());
+                            cx.shared.ld2.lock(|l| l.set_high());
+                        }
+                    } else {
+                        // No ramp set — immediate off
+                        cx.shared.motor.lock(|m| m.disable());
+                        cx.shared.relay.lock(|r| r.set_low());
+                        cx.shared.state.lock(|s| *s = STATE::IDLE);
+                    }
+
+                    // LED: green fading (toggling slower and slower)
+                    let rd_tick = cx
+                        .local
+                        .ramp
+                        .as_ref()
+                        .map(|r| if r.is_done() { 1 } else { 10 })
+                        .unwrap_or(1);
+                    if (*cx.local.run_elapsed_ms / 100) % 2 == 0 {
+                        cx.shared.ld1.lock(|l| l.toggle());
+                    }
+                }
+
+                // ─── FAULT: something went wrong ───
+                STATE::FAULT => {
+                    cx.shared.motor.lock(|m| m.force_off());
+                    cx.shared.relay.lock(|r| r.set_low());
+
+                    // Red solid
+                    cx.shared.ld3.lock(|l| l.set_high());
+                    cx.shared.ld1.lock(|l| l.set_low());
+
+                    // Yellow blinks the fault code (blink count = last state before fault)
+                    // TODO: implement blink-count pattern using last_fault
+
+                    match received_cmd {
+                        Some(Command::ClearFaults) | Some(Command::Stop) => {
+                            defmt::info!("Faults cleared → IDLE");
+                            cx.shared.last_fault.lock(|f| *f = None);
+                            cx.shared.state.lock(|s| *s = STATE::IDLE);
+                            cx.shared.ld3.lock(|l| l.set_low());
+                        }
+                        _ => {}
+                    }
+                }
+
+                // ─── ESTOP: physical button pressed ───
+                STATE::ESTOP => {
+                    cx.shared.motor.lock(|m| m.force_off());
+                    cx.shared.relay.lock(|r| r.set_low());
+
+                    // Red + yellow alternating flash
+                    static mut ESTOP_TICK: u32 = 0;
+                    unsafe {
+                        ESTOP_TICK += 1;
+                    }
+                    if unsafe { ESTOP_TICK } % 25 == 0 {
+                        cx.shared.ld3.lock(|l| l.toggle());
+                        cx.shared.ld2.lock(|l| l.toggle());
+                    }
+
+                    // Only ClearFaults or Stop can exit ESTOP
+                    match received_cmd {
+                        Some(Command::ClearFaults) | Some(Command::Stop) => {
+                            defmt::info!("ESTOP cleared → IDLE");
+                            cx.shared.state.lock(|s| *s = STATE::IDLE);
+                            cx.shared.ld3.lock(|l| l.set_low());
+                            cx.shared.ld2.lock(|l| l.set_low());
+                        }
+                        _ => {}
+                    }
+                }
+
+                _ => {}
+            }
+
+            Mono::delay(dt_ms.millis()).await;
         }
     }
 
-    #[task(priority = 1, shared = [encoder, tx, state])]
+    // ────────────────────────────────────────────
+    //  RPM Monitor — encoder reading + telemetry
+    // ────────────────────────────────────────────
+    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault])]
     async fn rpm_monitor(mut cx: rpm_monitor::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
@@ -362,44 +885,96 @@ mod app {
                 &mut cx.shared.encoder,
                 &mut cx.shared.tx,
                 &mut cx.shared.state,
+                &mut cx.shared.current_rpm,
+                &mut cx.shared.motor,
+                &mut cx.shared.run_config,
+                &mut cx.shared.last_fault,
             )
-                .lock(|enc, tx, state| {
-                    let current_count = enc.count();
-                    let delta_counts = current_count.wrapping_sub(last_count);
-                    last_count = current_count;
+                .lock(
+                    |enc, tx, state, current_rpm, motor, run_config, last_fault| {
+                        let current_count = enc.count();
+                        let delta = current_count.wrapping_sub(last_count);
+                        last_count = current_count;
 
-                    let counts_per_second = (delta_counts as i32 as f32) * 100.0;
-                    let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
+                        let counts_per_second = (delta as i32 as f32) * 100.0;
+                        let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
 
-                    // Build telemetry frame
-                    let frame = shared::models::telemetry::telemetry::Telemetry {
-                        ts_ms,
-                        state: *state,
-                        rpm,
-                        v_gen_rms: 0.0,
-                        i_gen_rms: 0.0,
-                        freq_gen_hz: 0.0,
-                        theta_err_rad: 0.0,
-                        temp_c: 0.0,
-                        dc_bus_v: 0.0,
-                    };
+                        *current_rpm = rpm;
 
-                    // Serialize to COBS — max postcard size for this struct is ~40 bytes
-                    if *state != STATE::BOOT {
-                        let mut buf = [0u8; 64];
-                        if let Ok(encoded) = postcard::to_slice_cobs(&frame, &mut buf) {
-                            for byte in encoded.iter() {
-                                block!(tx.write(*byte)).ok();
+                        let frame = shared::models::telemetry::telemetry::Telemetry {
+                            ts_ms,
+                            state: *state,
+                            rpm,
+                            duty_percent: motor.speed(),
+                            v_gen_rms: 0.0,
+                            i_gen_rms: 0.0,
+                            freq_gen_hz: 0.0,
+                            theta_err_rad: 0.0,
+                            temp_c: 0.0,
+                            dc_bus_v: 0.0,
+                            run_mode: run_config.map(|c| c.mode),
+                            fault: *last_fault,
+                        };
+
+                        if *state != STATE::BOOT {
+                            let mut buf = [0u8; 96];
+                            if let Ok(encoded) = postcard::to_slice_cobs(&frame, &mut buf) {
+                                for byte in encoded.iter() {
+                                    block!(tx.write(*byte)).ok();
+                                }
                             }
                         }
-                    }
 
-                    if loop_counter % 100 == 0 {
-                        defmt::info!("RPM: {} STATE: {}", rpm as i32, state.as_str());
-                    }
-                });
+                        if loop_counter % 100 == 0 {
+                            defmt::info!(
+                                "RPM: {} DUTY: {}% STATE: {}",
+                                rpm as i32,
+                                (motor.speed() * 100.0) as i32,
+                                state.as_str()
+                            );
+                        }
+                    },
+                );
 
             loop_counter = loop_counter.wrapping_add(1);
         }
     }
+
+    // ────────────────────────────────────────────
+    //  Helper: apply live parameter adjustment
+    // ────────────────────────────────────────────
+    // fn apply_live_param(cx: &mut state_manager::Context, param: LiveParam) {
+    //     match param {
+    //         LiveParam::Duty(d) => {
+    //             cx.shared.motor.lock(|m| m.set_speed(d));
+    //         }
+    //         LiveParam::TargetRpm(rpm) => {
+    //             cx.shared.run_config.lock(|rc| {
+    //                 if let Some(ref mut c) = rc {
+    //                     c.target_rpm = rpm;
+    //                 }
+    //             });
+    //         }
+    //         LiveParam::PidGains(gains) => {
+    //             cx.local.pid.set_gains(gains);
+    //         }
+    //         LiveParam::MaxDutyClamp(clamp) => {
+    //             cx.shared.motor.lock(|m| m.set_duty_clamp(clamp));
+    //         }
+    //         LiveParam::TargetFreqHz(hz) => {
+    //             cx.shared.run_config.lock(|rc| {
+    //                 if let Some(ref mut c) = rc {
+    //                     c.target_freq_hz = hz;
+    //                 }
+    //             });
+    //         }
+    //         LiveParam::TargetVRms(v) => {
+    //             cx.shared.run_config.lock(|rc| {
+    //                 if let Some(ref mut c) = rc {
+    //                     c.target_v_rms = v;
+    //                 }
+    //             });
+    //         }
+    //     }
+    // }
 }

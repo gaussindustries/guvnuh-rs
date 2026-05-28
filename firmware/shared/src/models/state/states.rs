@@ -41,12 +41,14 @@ pub enum STATE {
 
     */
     IDLE = 2,
+    /// RunConfig received, waiting for Start command
     /**
      * condition green, we've landed on mars
      * sends signal to esp32 to show all systems nominal, waits for esp32 to recieve 200 in order to proceed
      * once we recieve command via interface (from terminal - esp32, thus to demand to change state)
     	*/
-    SPOOLUP = 3,
+    CONFIGURED = 3,
+    SPOOLUP = 4,
     /**
     * set target voltages, phase/freq
     * spin up dc motor simulating work being performed on shaft based on below
@@ -61,40 +63,45 @@ pub enum STATE {
            measuring crucible temperature
 
     */
-    EXCITE = 4,
+    EXCITE = 5,
     /**
     * ensure our self excited induction generator (we would upgrade to vfd to not have this mess about in the future)
 
     */
-    PLL_LOCK = 5,
+    PLL_LOCK = 6,
     /**
     * PLL (def): ogase-locked loop has matched it';s output clock's frequency and phase ot the ref (VFD)
         Phase/Frequency detector -> loop filter -> VCO / DCO -> dividers
     */
-    READY = 6,
+    READY = 7,
     /**
      * gate not open yet to start using power
      */
-    GENERATE = 7,
+    GENERATE = 8,
     /**
      * once signal has been recieved we open gate (or auto if set on spoolup)
      */
-    LOAD_REJECTION = 8,
+    LOAD_REJECTION = 9,
+    /// Graceful ramp-down in progress (from any running state via Stop command)
     /**
      * react to drastic change (delta change of amps/load) from 100% to 0%, vise versa
      */
-    FAULT = 9,
+    RAMP_DOWN = 10,
+    /// Live manual control from desktop terminal
+    MANUAL = 11,
+    FAULT = 12,
     /**
     * based on priority from sensors && || gather loop/func of course write the fault enum to be read and sent to overlay
     this should of course send as much info as possible for debugging
     */
-    ESTOP = 10,
+    ESTOP = 13,
 }
+
 /**
  * once button is pressed (detected in real time)
  * set state back to idle, or rather go down safely or spool down of course send proper telemetry
  */
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Fault {
     OverVoltage,
     UnderVoltage,
@@ -102,6 +109,8 @@ pub enum Fault {
     OverTemp,
     NoExcitation,
     PllUnlock,
+    SensorOutOfRange,
+    CommLost,
 }
 
 impl STATE {
@@ -110,22 +119,43 @@ impl STATE {
             STATE::BOOT => "Boot",
             STATE::CALIBRATE => "Calibrate",
             STATE::IDLE => "Idle",
+            STATE::CONFIGURED => "Configured",
             STATE::SPOOLUP => "Spool Up",
             STATE::EXCITE => "Excite",
             STATE::PLL_LOCK => "PLL Lock",
             STATE::READY => "Ready",
             STATE::GENERATE => "Generate",
             STATE::LOAD_REJECTION => "Load Rejection",
+            STATE::RAMP_DOWN => "Ramp Down",
+            STATE::MANUAL => "Manual",
             STATE::FAULT => "FAULT",
             STATE::ESTOP => "ESTOP",
         }
     }
+
+    /// Is the system in a state where the motor/generator is energized?
+    pub fn is_running(self) -> bool {
+        matches!(
+            self,
+            STATE::SPOOLUP
+                | STATE::EXCITE
+                | STATE::PLL_LOCK
+                | STATE::READY
+                | STATE::GENERATE
+                | STATE::LOAD_REJECTION
+                | STATE::CALIBRATE
+                | STATE::MANUAL
+                | STATE::RAMP_DOWN
+        )
+    }
+
+    /// Is it safe to accept a Configure command?
+    pub fn accepts_configure(self) -> bool {
+        matches!(self, STATE::IDLE | STATE::CONFIGURED)
+    }
+
+    /// Is it safe to accept a Start command?
+    pub fn accepts_start(self) -> bool {
+        matches!(self, STATE::CONFIGURED)
+    }
 }
-
-// pub fn init(&self){
-
-// }
-
-// pub fn getState(&self){
-
-// }
