@@ -31,12 +31,27 @@ use shared::models::telemetry::telemetry::{Command, LiveParam, PidGains, RunConf
 
 systick_monotonic!(Mono, 1_000);
 
+/// Human-readable command name for defmt logging (Command doesn't derive defmt::Format).
+fn cmd_name(c: &Command) -> &'static str {
+    match c {
+        Command::Ping => "Ping",
+        Command::Configure(_) => "Configure",
+        Command::Start => "Start",
+        Command::Stop => "Stop",
+        Command::EmergencyStop => "EmergencyStop",
+        Command::LiveAdjust(_) => "LiveAdjust",
+        Command::Set(_) => "Set",
+        Command::ClearFaults => "ClearFaults",
+    }
+}
+
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
     use super::*;
     use stm32h7xx_hal::qei::Qei;
     type Motor = crate::guv::motor::MotorController;
     type Cfg = Option<RunConfig>;
+
     #[shared]
     pub struct Shared {
         // GPIO
@@ -60,12 +75,13 @@ mod app {
         pub run_config: Option<RunConfig>,
         pub current_rpm: f32,
         pub last_fault: Option<Fault>,
+        pub cmd_in: heapless::Deque<Command, 8>,
     }
 
     #[local]
     pub struct Local {
         safety_init_done: bool,
-        cmd_buf: [u8; 128],
+        cmd_buf: [u8; 128], // owned by the UART4 ISR
         cmd_len: usize,
         pid: crate::guv::pid::PidController,
         ramp: Option<crate::guv::ramp::Ramp>,
@@ -107,6 +123,7 @@ mod app {
                 run_config: None,
                 current_rpm: 0.0,
                 last_fault: None,
+                cmd_in: heapless::Deque::new(),
             },
             Local {
                 safety_init_done: false,
@@ -123,48 +140,17 @@ mod app {
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault],
-        local = [safety_init_done, cmd_buf, cmd_len, pid, ramp, run_elapsed_ms]
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in],
+        local = [safety_init_done, pid, ramp, run_elapsed_ms]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
         let dt_ms: u32 = 10;
 
         loop {
-            // ── Read incoming COBS command (non-blocking) ──
             let current_state = cx.shared.state.lock(|s| *s);
 
-            let received_cmd: Option<Command> = if current_state != STATE::BOOT {
-                let buf = &mut *cx.local.cmd_buf;
-                let len = &mut *cx.local.cmd_len;
-                cx.shared.rx.lock(|rx| {
-                    loop {
-                        match rx.read() {
-                            Ok(b) => {
-                                if b == 0x00 {
-                                    if *len > 0 {
-                                        if let Ok(cmd) =
-                                            postcard::from_bytes_cobs::<Command>(&mut buf[..*len])
-                                        {
-                                            *len = 0;
-                                            return Some(cmd);
-                                        }
-                                        *len = 0;
-                                    }
-                                } else if *len < buf.len() {
-                                    buf[*len] = b;
-                                    *len += 1;
-                                } else {
-                                    *len = 0;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    None
-                })
-            } else {
-                None
-            };
+            // ── Pull one decoded command from the ISR-fed queue ──
+            let received_cmd: Option<Command> = cx.shared.cmd_in.lock(|q| q.pop_front());
 
             // ── ESTOP — always honored, any state ──
             if let Some(Command::EmergencyStop) = received_cmd {
@@ -214,6 +200,9 @@ mod app {
 
                     if got_ok {
                         defmt::info!("Handshake OK — entering IDLE");
+                        // Arm the RX interrupt now (after handshake, so the ISR
+                        // doesn't eat the OK response above).
+                        cx.shared.rx.lock(|rx| rx.listen());
                         cx.shared.ld3.lock(|l| l.set_low());
                         cx.shared.ld2.lock(|l| l.set_high());
                         cx.shared.state.lock(|s| *s = STATE::IDLE);
@@ -360,11 +349,6 @@ mod app {
                     else if config.hold_ms == 0 || elapsed < config.ramp_up_ms + config.hold_ms {
                         cx.shared.motor.lock(|m| m.set_speed(1.0));
                         cx.shared.ld1.lock(|l| l.set_high());
-
-                        // If hold_ms == 0, hold indefinitely (until Stop)
-                        if config.hold_ms == 0 {
-                            // just hold
-                        }
                     }
                     // Phase 3: ramp down
                     else if elapsed < config.ramp_up_ms + config.hold_ms + config.ramp_down_ms {
@@ -405,12 +389,10 @@ mod app {
                     if let Some(Command::LiveAdjust(param)) = received_cmd {
                         match param {
                             LiveParam::Duty(d) => {
-                                cx.shared.motor.lock(
-                                    |m: &mut crate::guv::motor::MotorController| m.set_speed(d),
-                                );
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
                             }
                             LiveParam::TargetRpm(rpm) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_rpm = rpm;
                                     }
@@ -420,21 +402,19 @@ mod app {
                                 cx.local.pid.set_gains(gains);
                             }
                             LiveParam::MaxDutyClamp(clamp) => {
-                                cx.shared.motor.lock(
-                                    |m: &mut crate::guv::motor::MotorController| {
-                                        m.set_duty_clamp(clamp)
-                                    },
-                                );
+                                cx.shared
+                                    .motor
+                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
                             }
                             LiveParam::TargetFreqHz(hz) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_freq_hz = hz;
                                     }
                                 });
                             }
                             LiveParam::TargetVRms(v) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_v_rms = v;
                                     }
@@ -463,16 +443,13 @@ mod app {
                             *cx.local.ramp = None;
                             defmt::info!("Spoolup complete");
 
-                            // For Generate mode, advance through the sequence
-                            // For OpenLoop/ClosedLoop, stay in steady state here
                             match config.mode {
                                 RunMode::Generate => {
                                     cx.shared.state.lock(|s| *s = STATE::EXCITE);
                                     defmt::info!("→ EXCITE");
                                 }
                                 _ => {
-                                    // OpenLoop/ClosedLoop: just hold at speed
-                                    // (stays in SPOOLUP as a "running" state)
+                                    // OpenLoop/ClosedLoop: hold at speed (stay in SPOOLUP)
                                 }
                             }
                         }
@@ -521,16 +498,14 @@ mod app {
                         continue;
                     }
 
-                    // TODO: monitor v_gen_rms from ADC
-                    // When voltage builds to target_v_rms, advance to PLL_LOCK
-                    // For now, auto-advance after 3 seconds as placeholder
+                    // TODO: monitor v_gen_rms from ADC; advance when voltage builds.
+                    // Placeholder: auto-advance after 3 seconds.
                     *cx.local.run_elapsed_ms += dt_ms;
                     if *cx.local.run_elapsed_ms > config.ramp_up_ms + 3000 {
                         defmt::info!("Excitation nominal → PLL_LOCK");
                         cx.shared.state.lock(|s| *s = STATE::PLL_LOCK);
                     }
 
-                    // LED: yellow fast blink
                     cx.shared.ld2.lock(|l| l.toggle());
                 }
 
@@ -547,14 +522,12 @@ mod app {
                         continue;
                     }
 
-                    // TODO: phase detector + loop filter on theta_err_rad
-                    // When |theta_err| < threshold, advance to READY
-                    // Placeholder: auto-advance after 2 seconds
+                    // TODO: phase detector + loop filter on theta_err_rad.
+                    // Placeholder: auto-advance after 2 seconds past excite.
                     *cx.local.run_elapsed_ms += dt_ms;
                     if *cx.local.run_elapsed_ms > config.ramp_up_ms + 5000 {
                         defmt::info!("PLL locked → READY");
                         cx.shared.state.lock(|s| *s = STATE::READY);
-                        // One green blink to signal lock
                         cx.shared.ld1.lock(|l| l.set_high());
                     }
 
@@ -591,12 +564,10 @@ mod app {
                     if let Some(Command::LiveAdjust(param)) = received_cmd {
                         match param {
                             LiveParam::Duty(d) => {
-                                cx.shared.motor.lock(
-                                    |m: &mut crate::guv::motor::MotorController| m.set_speed(d),
-                                );
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
                             }
                             LiveParam::TargetRpm(rpm) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_rpm = rpm;
                                     }
@@ -606,21 +577,19 @@ mod app {
                                 cx.local.pid.set_gains(gains);
                             }
                             LiveParam::MaxDutyClamp(clamp) => {
-                                cx.shared.motor.lock(
-                                    |m: &mut crate::guv::motor::MotorController| {
-                                        m.set_duty_clamp(clamp)
-                                    },
-                                );
+                                cx.shared
+                                    .motor
+                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
                             }
                             LiveParam::TargetFreqHz(hz) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_freq_hz = hz;
                                     }
                                 });
                             }
                             LiveParam::TargetVRms(v) => {
-                                cx.shared.run_config.lock(|rc: &mut Option<RunConfig>| {
+                                cx.shared.run_config.lock(|rc: &mut Cfg| {
                                     if let Some(ref mut c) = rc {
                                         c.target_v_rms = v;
                                     }
@@ -629,15 +598,12 @@ mod app {
                         }
                     }
 
-                    // TODO: auto-transition to GENERATE when load is connected
-                    // or when desktop sends a "gate open" command
-                    // For now, desktop sends Start again to open gate (reuse command)
+                    // Second Start = gate open → GENERATE (placeholder gate control)
                     if let Some(Command::Start) = received_cmd {
                         defmt::info!("Gate open → GENERATE");
                         cx.shared.state.lock(|s| *s = STATE::GENERATE);
                     }
 
-                    // LED: steady green
                     cx.shared.ld1.lock(|l| l.set_high());
                     cx.shared.ld2.lock(|l| l.set_low());
                 }
@@ -655,7 +621,6 @@ mod app {
                         continue;
                     }
 
-                    // Closed-loop RPM/frequency regulation
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
                     let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
@@ -700,9 +665,7 @@ mod app {
                     }
 
                     // TODO: detect load rejection (large delta in current/RPM)
-                    // If |rpm - target| > threshold, transition to LOAD_REJECTION
 
-                    // LED: steady green
                     cx.shared.ld1.lock(|l| l.set_high());
                 }
 
@@ -719,21 +682,17 @@ mod app {
                         continue;
                     }
 
-                    // Aggressive PID recovery — same controller, just let it work
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
                     let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
                     cx.shared.motor.lock(|m| m.set_speed(output));
 
-                    // TODO: when RPM stabilizes within tolerance, return to GENERATE
                     let error = (config.target_rpm - measured).abs();
                     if error < config.target_rpm * 0.02 {
-                        // Within 2% — recovered
                         defmt::info!("Load rejection recovered → GENERATE");
                         cx.shared.state.lock(|s| *s = STATE::GENERATE);
                     }
 
-                    // LED: fast green/yellow alternating
                     cx.shared.ld1.lock(|l| l.toggle());
                     cx.shared.ld2.lock(|l| l.toggle());
                 }
@@ -748,7 +707,6 @@ mod app {
                             cx.shared.motor.lock(|m| m.set_duty_clamp(c));
                         }
                         Some(Command::LiveAdjust(LiveParam::TargetRpm(rpm))) => {
-                            // Switch to closed-loop on the fly
                             cx.shared.run_config.lock(|rc| {
                                 if let Some(ref mut c) = rc {
                                     c.target_rpm = rpm;
@@ -792,35 +750,25 @@ mod app {
                             cx.shared.ld2.lock(|l| l.set_high());
                         }
                     } else {
-                        // No ramp set — immediate off
                         cx.shared.motor.lock(|m| m.disable());
                         cx.shared.relay.lock(|r| r.set_low());
                         cx.shared.state.lock(|s| *s = STATE::IDLE);
                     }
 
-                    // LED: green fading (toggling slower and slower)
-                    let rd_tick = cx
-                        .local
-                        .ramp
-                        .as_ref()
-                        .map(|r| if r.is_done() { 1 } else { 10 })
-                        .unwrap_or(1);
                     if (*cx.local.run_elapsed_ms / 100) % 2 == 0 {
                         cx.shared.ld1.lock(|l| l.toggle());
                     }
                 }
 
-                // ─── FAULT: something went wrong ───
+                // ─── FAULT ───
                 STATE::FAULT => {
                     cx.shared.motor.lock(|m| m.force_off());
                     cx.shared.relay.lock(|r| r.set_low());
 
-                    // Red solid
                     cx.shared.ld3.lock(|l| l.set_high());
                     cx.shared.ld1.lock(|l| l.set_low());
 
-                    // Yellow blinks the fault code (blink count = last state before fault)
-                    // TODO: implement blink-count pattern using last_fault
+                    // TODO: yellow blink-count pattern of last state before fault
 
                     match received_cmd {
                         Some(Command::ClearFaults) | Some(Command::Stop) => {
@@ -833,12 +781,11 @@ mod app {
                     }
                 }
 
-                // ─── ESTOP: physical button pressed ───
+                // ─── ESTOP ───
                 STATE::ESTOP => {
                     cx.shared.motor.lock(|m| m.force_off());
                     cx.shared.relay.lock(|r| r.set_low());
 
-                    // Red + yellow alternating flash
                     static mut ESTOP_TICK: u32 = 0;
                     unsafe {
                         ESTOP_TICK += 1;
@@ -848,7 +795,6 @@ mod app {
                         cx.shared.ld2.lock(|l| l.toggle());
                     }
 
-                    // Only ClearFaults or Stop can exit ESTOP
                     match received_cmd {
                         Some(Command::ClearFaults) | Some(Command::Stop) => {
                             defmt::info!("ESTOP cleared → IDLE");
@@ -941,40 +887,42 @@ mod app {
     }
 
     // ────────────────────────────────────────────
-    //  Helper: apply live parameter adjustment
+    //  UART4 RX ISR — drains FIFO, decodes COBS, queues commands
     // ────────────────────────────────────────────
-    // fn apply_live_param(cx: &mut state_manager::Context, param: LiveParam) {
-    //     match param {
-    //         LiveParam::Duty(d) => {
-    //             cx.shared.motor.lock(|m| m.set_speed(d));
-    //         }
-    //         LiveParam::TargetRpm(rpm) => {
-    //             cx.shared.run_config.lock(|rc| {
-    //                 if let Some(ref mut c) = rc {
-    //                     c.target_rpm = rpm;
-    //                 }
-    //             });
-    //         }
-    //         LiveParam::PidGains(gains) => {
-    //             cx.local.pid.set_gains(gains);
-    //         }
-    //         LiveParam::MaxDutyClamp(clamp) => {
-    //             cx.shared.motor.lock(|m| m.set_duty_clamp(clamp));
-    //         }
-    //         LiveParam::TargetFreqHz(hz) => {
-    //             cx.shared.run_config.lock(|rc| {
-    //                 if let Some(ref mut c) = rc {
-    //                     c.target_freq_hz = hz;
-    //                 }
-    //             });
-    //         }
-    //         LiveParam::TargetVRms(v) => {
-    //             cx.shared.run_config.lock(|rc| {
-    //                 if let Some(ref mut c) = rc {
-    //                     c.target_v_rms = v;
-    //                 }
-    //             });
-    //         }
-    //     }
-    // }
+    #[task(binds = UART4, priority = 3, shared = [rx, cmd_in], local = [cmd_buf, cmd_len])]
+    fn uart4_rx(mut cx: uart4_rx::Context) {
+        let buf = &mut *cx.local.cmd_buf;
+        let len = &mut *cx.local.cmd_len;
+
+        cx.shared.rx.lock(|rx| {
+            loop {
+                match rx.read() {
+                    Ok(b) => {
+                        if b == 0x00 {
+                            if *len > 0 {
+                                match postcard::from_bytes_cobs::<Command>(&mut buf[..*len]) {
+                                    Ok(cmd) => {
+                                        defmt::info!("CMD recv: {}", cmd_name(&cmd));
+                                        cx.shared.cmd_in.lock(|q| {
+                                            if q.push_back(cmd).is_err() {
+                                                defmt::warn!("cmd queue full — dropped");
+                                            }
+                                        });
+                                    }
+                                    Err(_) => defmt::warn!("cmd decode fail ({} bytes)", *len),
+                                }
+                                *len = 0;
+                            }
+                        } else if *len < buf.len() {
+                            buf[*len] = b;
+                            *len += 1;
+                        } else {
+                            *len = 0;
+                        }
+                    }
+                    Err(_) => break, // WouldBlock: FIFO drained
+                }
+            }
+        });
+    }
 }
