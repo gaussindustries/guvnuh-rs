@@ -76,6 +76,7 @@ mod app {
         pub current_rpm: f32,
         pub last_fault: Option<Fault>,
         pub cmd_in: heapless::Deque<Command, 8>,
+        pub calibration: Option<crate::guv::calibrate::CalResult>,
     }
 
     #[local]
@@ -86,6 +87,7 @@ mod app {
         pid: crate::guv::pid::PidController,
         ramp: Option<crate::guv::ramp::Ramp>,
         run_elapsed_ms: u32,
+        calibrator: Option<crate::guv::calibrate::Calibrator>,
     }
 
     #[init]
@@ -124,6 +126,7 @@ mod app {
                 current_rpm: 0.0,
                 last_fault: None,
                 cmd_in: heapless::Deque::new(),
+                calibration: None,
             },
             Local {
                 safety_init_done: false,
@@ -132,6 +135,7 @@ mod app {
                 pid: crate::guv::pid::PidController::new(PidGains::default()),
                 ramp: None,
                 run_elapsed_ms: 0,
+                calibrator: None,
             },
         )
     }
@@ -140,8 +144,8 @@ mod app {
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in],
-        local = [safety_init_done, pid, ramp, run_elapsed_ms]
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration],
+        local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
         let dt_ms: u32 = 10;
@@ -277,6 +281,11 @@ mod app {
                             cx.local.pid.reset();
                             *cx.local.run_elapsed_ms = 0;
 
+                            //calibrate for our coefficents
+                            if config.mode == RunMode::Calibrate {
+                                *cx.local.calibrator =
+                                    Some(crate::guv::calibrate::Calibrator::new());
+                            }
                             // Set up ramp for non-manual modes
                             if config.mode != RunMode::Manual {
                                 *cx.local.ramp =
@@ -324,50 +333,56 @@ mod app {
                 // ─── CALIBRATE: simple motor test sequence ───
                 STATE::CALIBRATE => {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
-                    *cx.local.run_elapsed_ms += dt_ms;
-                    let elapsed = *cx.local.run_elapsed_ms;
 
                     if let Some(Command::Stop) = received_cmd {
                         defmt::info!("STOP during calibration");
                         let speed = cx.shared.motor.lock(|m| m.speed());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                        *cx.local.calibrator = None;
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
                         Mono::delay(dt_ms.millis()).await;
                         continue;
                     }
 
-                    // Phase 1: ramp up
-                    if elapsed < config.ramp_up_ms {
-                        let progress = elapsed as f32 / config.ramp_up_ms as f32;
-                        cx.shared.motor.lock(|m| m.set_speed(progress));
-                        if (elapsed / 100) % 2 == 0 {
-                            cx.shared.ld1.lock(|l| l.toggle());
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+
+                    let out = match cx.local.calibrator {
+                        Some(cal) => cal.step(measured, dt_ms),
+                        None => {
+                            // safety: no calibrator → bail to IDLE
+                            cx.shared.state.lock(|s| *s = STATE::IDLE);
+                            Mono::delay(dt_ms.millis()).await;
+                            continue;
                         }
+                    };
+
+                    cx.shared.motor.lock(|m| m.set_speed(out.duty));
+
+                    if let Some(res) = out.result {
+                        defmt::info!(
+                            "CAL done: k={} rpm/duty  intercept={}  max_rpm={}",
+                            res.k_rpm_per_duty as i32,
+                            res.rpm_intercept as i32,
+                            res.max_rpm as i32
+                        );
+                        cx.shared.calibration.lock(|c| *c = Some(res));
                     }
-                    // Phase 2: hold
-                    else if config.hold_ms == 0 || elapsed < config.ramp_up_ms + config.hold_ms {
-                        cx.shared.motor.lock(|m| m.set_speed(1.0));
-                        cx.shared.ld1.lock(|l| l.set_high());
-                    }
-                    // Phase 3: ramp down
-                    else if elapsed < config.ramp_up_ms + config.hold_ms + config.ramp_down_ms {
-                        let rd_elapsed = elapsed - config.ramp_up_ms - config.hold_ms;
-                        let progress = 1.0 - (rd_elapsed as f32 / config.ramp_down_ms as f32);
-                        cx.shared.motor.lock(|m| m.set_speed(progress));
-                        if (elapsed / 200) % 2 == 0 {
-                            cx.shared.ld1.lock(|l| l.toggle());
-                        }
-                    }
-                    // Done
-                    else {
-                        defmt::info!("Calibration complete — IDLE");
+
+                    if out.done {
                         cx.shared.motor.lock(|m| m.disable());
                         cx.shared.relay.lock(|r| r.set_low());
+                        *cx.local.calibrator = None;
                         *cx.local.run_elapsed_ms = 0;
                         cx.shared.state.lock(|s| *s = STATE::IDLE);
                         cx.shared.ld1.lock(|l| l.set_low());
                         cx.shared.ld2.lock(|l| l.set_high());
+                    } else {
+                        // heartbeat: green blink during calibration
+                        *cx.local.run_elapsed_ms += dt_ms;
+                        if (*cx.local.run_elapsed_ms / 150) % 2 == 0 {
+                            cx.shared.ld1.lock(|l| l.toggle());
+                        }
                     }
                 }
 

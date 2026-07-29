@@ -1,3 +1,4 @@
+pub mod calibrate;
 pub mod motor;
 pub mod pid;
 pub mod ramp;
