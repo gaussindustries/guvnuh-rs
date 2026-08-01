@@ -24,7 +24,7 @@ use cortex_m::peripheral::scb::SystemHandler;
 mod guv;
 mod models;
 
-use crate::models::status::WorkerStatus;
+use crate::models::{measurements::Measurements, status::WorkerStatus};
 use nb::block;
 use shared::models::state::states::{Fault, STATE};
 use shared::models::telemetry::telemetry::{Command, LiveParam, PidGains, RunConfig, RunMode};
@@ -48,6 +48,7 @@ fn cmd_name(c: &Command) -> &'static str {
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
     use super::*;
+    use shared::models::telemetry::telemetry::Uplink;
     use stm32h7xx_hal::qei::Qei;
     type Motor = crate::guv::motor::MotorController;
     type Cfg = Option<RunConfig>;
@@ -76,7 +77,10 @@ mod app {
         pub current_rpm: f32,
         pub last_fault: Option<Fault>,
         pub cmd_in: heapless::Deque<Command, 8>,
+
+        pub measurements: crate::models::measurements::Measurements,
         pub calibration: Option<crate::guv::calibrate::CalResult>,
+        pub pending_report: Option<shared::models::telemetry::telemetry::CalibrationReport>,
     }
 
     #[local]
@@ -107,7 +111,7 @@ mod app {
         Mono::start(cx.core.SYST, sys_freq);
 
         state_manager::spawn().ok();
-        rpm_monitor::spawn().ok();
+        telemetry_task::spawn().ok();
 
         board.ld3.set_high(); // Red = booting
 
@@ -127,6 +131,8 @@ mod app {
                 last_fault: None,
                 cmd_in: heapless::Deque::new(),
                 calibration: None,
+                pending_report: None,
+                measurements: crate::models::measurements::Measurements::default(),
             },
             Local {
                 safety_init_done: false,
@@ -144,7 +150,7 @@ mod app {
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration],
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report],
         local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
@@ -330,7 +336,7 @@ mod app {
                     }
                 }
 
-                // ─── CALIBRATE: simple motor test sequence ───
+                // ─── CALIBRATE: compute k, square(r) value derived from rpm, duty pairs ───
                 STATE::CALIBRATE => {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
@@ -347,10 +353,9 @@ mod app {
 
                     let measured = cx.shared.current_rpm.lock(|r| *r);
 
-                    let out = match cx.local.calibrator {
+                    let out = match cx.local.calibrator.as_mut() {
                         Some(cal) => cal.step(measured, dt_ms),
                         None => {
-                            // safety: no calibrator → bail to IDLE
                             cx.shared.state.lock(|s| *s = STATE::IDLE);
                             Mono::delay(dt_ms.millis()).await;
                             continue;
@@ -360,13 +365,54 @@ mod app {
                     cx.shared.motor.lock(|m| m.set_speed(out.duty));
 
                     if let Some(res) = out.result {
-                        defmt::info!(
-                            "CAL done: k={} rpm/duty  intercept={}  max_rpm={}",
-                            res.k_rpm_per_duty as i32,
-                            res.rpm_intercept as i32,
-                            res.max_rpm as i32
-                        );
+                        if res.valid {
+                            defmt::info!(
+                                "CAL OK: k={} rpm/duty  intercept={}  max_rpm={}  r2={}%",
+                                res.k_rpm_per_duty as i32,
+                                res.rpm_intercept as i32,
+                                res.max_rpm as i32,
+                                (res.r_squared * 100.0) as i32
+                            );
+                        } else {
+                            defmt::warn!(
+                                "CAL REJECTED: k={} r2={}% — feedforward disabled",
+                                res.k_rpm_per_duty as i32,
+                                (res.r_squared * 100.0) as i32
+                            );
+                        }
+                        for p in &res.points[..res.point_count as usize] {
+                            defmt::info!(
+                                "  pt duty={}% rpm={} sd={} n={}",
+                                (p.duty * 100.0) as i32,
+                                p.rpm_mean as i32,
+                                p.rpm_stddev as i32,
+                                p.samples
+                            );
+                        }
                         cx.shared.calibration.lock(|c| *c = Some(res));
+
+                        // build wire report and queue it for telemetry_task to send (even if rejected)
+                        let mut points =
+                            [shared::models::telemetry::telemetry::CalPointWire::default(); 4];
+                        for (i, p) in res.points.iter().enumerate() {
+                            points[i] = shared::models::telemetry::telemetry::CalPointWire {
+                                duty: p.duty,
+                                rpm_mean: p.rpm_mean,
+                                rpm_stddev: p.rpm_stddev,
+                                samples: p.samples,
+                            };
+                        }
+                        let report = shared::models::telemetry::telemetry::CalibrationReport {
+                            ts_ms: *cx.local.run_elapsed_ms,
+                            k_rpm_per_duty: res.k_rpm_per_duty,
+                            rpm_intercept: res.rpm_intercept,
+                            max_rpm: res.max_rpm,
+                            r_squared: res.r_squared,
+                            points,
+                            point_count: res.point_count,
+                            valid: res.valid,
+                        };
+                        cx.shared.pending_report.lock(|slot| *slot = Some(report));
                     }
 
                     if out.done {
@@ -378,7 +424,6 @@ mod app {
                         cx.shared.ld1.lock(|l| l.set_low());
                         cx.shared.ld2.lock(|l| l.set_high());
                     } else {
-                        // heartbeat: green blink during calibration
                         *cx.local.run_elapsed_ms += dt_ms;
                         if (*cx.local.run_elapsed_ms / 150) % 2 == 0 {
                             cx.shared.ld1.lock(|l| l.toggle());
@@ -446,8 +491,17 @@ mod app {
                                 let target_rpm = config.target_rpm * val;
                                 let measured = cx.shared.current_rpm.lock(|r| *r);
                                 let dt_s = dt_ms as f32 / 1000.0;
-                                let output = cx.local.pid.update(target_rpm, measured, dt_s);
-                                cx.shared.motor.lock(|m| m.set_speed(output));
+
+                                let ff = cx
+                                    .shared
+                                    .calibration
+                                    .lock(|c| c.and_then(|cal| cal.feedforward(target_rpm)))
+                                    .unwrap_or(0.0);
+
+                                let trim = cx.local.pid.update(target_rpm, measured, dt_s);
+                                cx.shared
+                                    .motor
+                                    .lock(|m| m.set_speed((ff + trim).clamp(0.0, 1.0)));
                             }
                             _ => {
                                 cx.shared.motor.lock(|m| m.set_speed(val));
@@ -831,17 +885,18 @@ mod app {
     // ────────────────────────────────────────────
     //  RPM Monitor — encoder reading + telemetry
     // ────────────────────────────────────────────
-    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault])]
-    async fn rpm_monitor(mut cx: rpm_monitor::Context) {
+    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault, measurements, pending_report])]
+    async fn telemetry_task(mut cx: telemetry_task::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
         let mut loop_counter: u32 = 0;
         let mut ts_ms: u32 = 0;
-
         loop {
             Mono::delay(10u32.millis()).await;
             ts_ms = ts_ms.wrapping_add(10);
 
+            // drain the calibration outbox (atomic take)
+            let report = cx.shared.pending_report.lock(|slot| slot.take());
             (
                 &mut cx.shared.encoder,
                 &mut cx.shared.tx,
@@ -850,38 +905,58 @@ mod app {
                 &mut cx.shared.motor,
                 &mut cx.shared.run_config,
                 &mut cx.shared.last_fault,
+                &mut cx.shared.measurements,
             )
                 .lock(
-                    |enc, tx, state, current_rpm, motor, run_config, last_fault| {
+                    |enc, tx, state, current_rpm, motor, run_config, last_fault, meas| {
+                        // ── acquisition: encoder → rpm ──
                         let current_count = enc.count();
                         let delta = current_count.wrapping_sub(last_count);
                         last_count = current_count;
-
                         let counts_per_second = (delta as i32 as f32) * 100.0;
                         let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
 
+                        // write into BOTH: control loop reads current_rpm, telemetry reads measurements.
+                        // when the ADC lands, a separate `measurement` task fills meas.v_gen_rms etc.
                         *current_rpm = rpm;
+                        meas.rpm = rpm;
 
+                        // ── assembly: frame is built FROM measurements ──
                         let frame = shared::models::telemetry::telemetry::Telemetry {
                             ts_ms,
                             state: *state,
-                            rpm,
+                            rpm: meas.rpm,
                             duty_percent: motor.speed(),
-                            v_gen_rms: 0.0,
-                            i_gen_rms: 0.0,
-                            freq_gen_hz: 0.0,
-                            theta_err_rad: 0.0,
-                            temp_c: 0.0,
-                            dc_bus_v: 0.0,
+                            v_gen_rms: meas.v_gen_rms,
+                            i_gen_rms: meas.i_gen_rms,
+                            freq_gen_hz: meas.freq_gen_hz,
+                            theta_err_rad: 0.0, // still a stub — no sensor
+                            temp_c: meas.temp_c,
+                            dc_bus_v: meas.dc_bus_v,
                             run_mode: run_config.map(|c| c.mode),
                             fault: *last_fault,
                         };
 
                         if *state != STATE::BOOT {
                             let mut buf = [0u8; 96];
-                            if let Ok(encoded) = postcard::to_slice_cobs(&frame, &mut buf) {
+                            if let Ok(encoded) =
+                                postcard::to_slice_cobs(&Uplink::Telemetry(frame), &mut buf)
+                            {
                                 for byte in encoded.iter() {
                                     block!(tx.write(*byte)).ok();
+                                }
+                            }
+
+                            // send a pending calibration report, if one was queued
+                            if let Some(rep) = report {
+                                let mut rbuf = [0u8; 96];
+                                if let Ok(encoded) =
+                                    postcard::to_slice_cobs(&Uplink::Calibration(rep), &mut rbuf)
+                                {
+                                    for byte in encoded.iter() {
+                                        block!(tx.write(*byte)).ok();
+                                    }
+                                    defmt::info!("Calibration report sent");
                                 }
                             }
                         }
@@ -896,7 +971,6 @@ mod app {
                         }
                     },
                 );
-
             loop_counter = loop_counter.wrapping_add(1);
         }
     }
@@ -940,4 +1014,20 @@ mod app {
             }
         });
     }
+    // FUTURE — do not add until ADS131M04 is wired
+    // #[task(priority = 1, shared = [encoder, measurements], local = [/* adc handle, sample buffer */])]
+    // async fn measurement(mut cx: measurement::Context) {
+    //     loop {
+    //         Mono::delay(10u32.millis()).await;
+    //         // read encoder → rpm  (moves here, out of telemetry_task)
+    //         // compute RMS/freq from the adc_sampler's buffer
+    //         cx.shared.measurements.lock(|m| {
+    //             m.rpm = /* encoder */;
+    //             m.v_gen_rms = /* computed */;
+    //             m.i_gen_rms = /* computed */;
+    //             m.freq_gen_hz = /* zero-cross */;
+    //             m.dc_bus_v = /* adc channel */;
+    //         });
+    //     }
+    // }
 }

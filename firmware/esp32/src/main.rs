@@ -212,35 +212,34 @@ async fn tcp_task(
         led.set_high();
 
         'conn: loop {
-            // UART -> TCP (COBS framed telemetry from STM32)
-            if uart.read(&mut uart_buf).is_ok() {
-                let b = uart_buf[0];
-                led.toggle();
-
-                if b == 0x00 {
-                    // End of COBS frame — forward complete frame + terminator
-                    if cobs_len > 0 {
-                        if socket.write_all(&cobs_buf[..cobs_len]).await.is_err() {
-                            break 'conn;
+            // UART -> TCP: drain ALL available bytes, not one per iteration
+            let mut chunk = [0u8; 64];
+            match uart.read(&mut chunk) {
+                Ok(n) if n > 0 => {
+                    led.toggle();
+                    for &b in &chunk[..n] {
+                        if b == 0x00 {
+                            if cobs_len > 0 {
+                                if socket.write_all(&cobs_buf[..cobs_len]).await.is_err() {
+                                    break 'conn;
+                                }
+                                if socket.write_all(&[0x00]).await.is_err() {
+                                    break 'conn;
+                                }
+                                cobs_len = 0;
+                            }
+                        } else if cobs_len < cobs_buf.len() {
+                            cobs_buf[cobs_len] = b;
+                            cobs_len += 1;
+                        } else {
+                            cobs_len = 0; // overflow guard
                         }
-                        if socket.write_all(&[0x00]).await.is_err() {
-                            break 'conn;
-                        }
-                        cobs_len = 0;
-                    }
-                } else {
-                    // Accumulate frame bytes
-                    if cobs_len < cobs_buf.len() {
-                        cobs_buf[cobs_len] = b;
-                        cobs_len += 1;
-                    } else {
-                        // Buffer overflow — corrupted frame, discard
-                        cobs_len = 0;
                     }
                 }
+                _ => {}
             }
 
-            // TCP -> UART (Commands from server to STM32) non-blocking
+            // TCP -> UART (unchanged)
             let mut cmd_buf = [0u8; 32];
             match embassy_futures::select::select(
                 socket.read(&mut cmd_buf),

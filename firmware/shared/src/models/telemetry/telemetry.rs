@@ -12,6 +12,40 @@
 use crate::models::state::states::{Fault, STATE};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum Uplink {
+    Telemetry(Telemetry),
+    Calibration(CalibrationReport),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CalibrationReport {
+    pub ts_ms: u32,
+    pub k_rpm_per_duty: f32,
+    pub rpm_intercept: f32,
+    pub max_rpm: f32,
+    pub r_squared: f32,
+    pub points: [CalPointWire; 4], // fixed — matches CAL_POINTS.len()
+    pub point_count: u8,
+    pub valid: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CalPointWire {
+    pub duty: f32,
+    pub rpm_mean: f32,
+    pub rpm_stddev: f32,
+    pub samples: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CalPoint {
+    pub duty: f32,
+    pub rpm_mean: f32,
+    pub rpm_stddev: f32, // ← settling quality per point
+    pub samples: u32,
+}
+
 /// Single telemetry sample — canonical wire format.
 /// Serialized via postcard/COBS over UART, deserialized on the server.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
