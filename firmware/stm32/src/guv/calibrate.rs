@@ -10,7 +10,9 @@
 
 /// Duty levels to sample, low→high. Avoid very low duties where static friction
 /// dominates and the relationship goes nonlinear. Tune to the rig.
-pub const CAL_POINTS: [f32; 4] = [0.30, 0.55, 0.70, 0.85];
+/// make sure to update the report struct:
+/// ~/firmware/shared/src/models/telemetry/telemetry.rs
+pub const CAL_POINTS: [f32; 5] = [0.35, 0.4875, 0.625, 0.7625, 0.90];
 
 /// Hold time per duty level, ms. Must exceed mechanical settling time — if RPM is
 /// still climbing when we sample, the fit lies. Watch the trace and lengthen this
@@ -32,7 +34,7 @@ const MIN_SLOPE: f32 = 1.0;
 const MAX_SLOPE: f32 = 100_000.0;
 /// Per-point noise ceiling: stddev as a fraction of mean. Above this the point
 /// never settled.
-const MAX_POINT_CV: f32 = 0.15;
+const MAX_POINT_CV: f32 = 0.10;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {

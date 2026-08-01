@@ -393,7 +393,8 @@ mod app {
 
                         // build wire report and queue it for telemetry_task to send (even if rejected)
                         let mut points =
-                            [shared::models::telemetry::telemetry::CalPointWire::default(); 4];
+                            [shared::models::telemetry::telemetry::CalPointWire::default();
+                                crate::guv::calibrate::CAL_POINTS.len()];
                         for (i, p) in res.points.iter().enumerate() {
                             points[i] = shared::models::telemetry::telemetry::CalPointWire {
                                 duty: p.duty,

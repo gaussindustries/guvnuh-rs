@@ -25,7 +25,8 @@ pub struct CalibrationReport {
     pub rpm_intercept: f32,
     pub max_rpm: f32,
     pub r_squared: f32,
-    pub points: [CalPointWire; 4], // fixed — matches CAL_POINTS.len()
+    pub points: [CalPointWire; 5],
+    //^^ fixed — must match CAL_POINTS.len() within ~/calibration.rs
     pub point_count: u8,
     pub valid: bool,
 }
