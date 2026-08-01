@@ -283,6 +283,8 @@ rejection, drift comparison across runs — and eventually push a lookup table
 back down via the `Configure` prelude, all without reflashing firmware attached
 to a spinning mass. This is the seam the Phase 4 turbine fork is built around.
 
+![Calibration Example](githubMedia/Calibration-Still-Aug-26.png)
+
 ---
 
 ## REST API Reference
