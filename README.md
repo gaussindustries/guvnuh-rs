@@ -3,6 +3,12 @@
 ![Guv'nuh Alpha Preview](githubMedia/Still-Aug-26.png)
 ![Guv'nuh Live Demo](githubMedia/preview_v6.gif)
 
+> This is showing the calibration step, please see below for HQ screen shot
+
+![Guv'nuh Showcase](githubMedia/V1_Showcase.jpg)
+
+> August 13th (this is going to be as tidy as the left hand side once completed)
+
 A laboratory-scale governor architecture that converts a standard DC motor into a
 **secure, programmable micro-generator testbed**. This platform demonstrates a
 "Zero-Trust" industrial control loop, fusing hard real-time safety (STM32/RTIC)

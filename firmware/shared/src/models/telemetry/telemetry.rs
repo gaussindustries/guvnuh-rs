@@ -84,6 +84,7 @@ pub struct RunConfig {
     pub max_duty_clamp: f32,
     pub target_freq_hz: f32,
     pub target_v_rms: f32,
+    pub max_amperage_clamp: f32,
 }
 
 impl Default for RunConfig {
@@ -98,6 +99,7 @@ impl Default for RunConfig {
             max_duty_clamp: 1.0,
             target_freq_hz: 60.0,
             target_v_rms: 120.0,
+            max_amperage_clamp: 1.0,
         }
     }
 }
