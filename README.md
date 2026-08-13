@@ -5,7 +5,7 @@
 
 > This is showing the calibration step, please see below for HQ screen shot
 
-![Guv'nuh Showcase](githubMedia/V1_Showcase.jpg)
+![Guv'nuh Showcase](githubMedia/V1_Showcase.png)
 
 > August 13th (this is going to be as tidy as the left hand side once completed)
 
