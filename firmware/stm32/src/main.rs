@@ -24,6 +24,7 @@ use cortex_m::peripheral::scb::SystemHandler;
 mod guv;
 mod models;
 
+use crate::guv::prime_mover::PrimeMover;
 use crate::models::{measurements::Measurements, status::WorkerStatus};
 use nb::block;
 use shared::models::state::states::{Fault, STATE};
@@ -203,7 +204,7 @@ mod app {
 
             if let Some(fault) = trip {
                 // Actuators OFF first — fastest path to safe.
-                cx.shared.motor.lock(|m| m.force_off());
+                cx.shared.motor.lock(|m| m.emergency_off());
                 cx.shared.relay.lock(|r| r.set_low());
 
                 // Transition + log only on the EDGE (don't spam while coasting down).
@@ -251,7 +252,7 @@ mod app {
             // ── ESTOP — always honored, any state ──
             if let Some(Command::EmergencyStop) = received_cmd {
                 defmt::warn!("!! EMERGENCY STOP !!");
-                cx.shared.motor.lock(|m| m.force_off());
+                cx.shared.motor.lock(|m| m.emergency_off());
                 cx.shared.relay.lock(|r| r.set_low());
                 cx.shared.state.lock(|s| *s = STATE::ESTOP);
                 cx.local.pid.reset();
@@ -288,7 +289,7 @@ mod app {
                 // ─── BOOT: safety init + framed Hello handshake ───
                 STATE::BOOT => {
                     if !*cx.local.safety_init_done {
-                        cx.shared.motor.lock(|m| m.force_off());
+                        cx.shared.motor.lock(|m| m.emergency_off());
                         cx.shared.relay.lock(|r| r.set_low());
                         // Arm the RX ISR ONCE, up front. The handshake now flows
                         // through the same COBS/command path as everything else,
@@ -368,7 +369,7 @@ mod app {
                             );
                             cx.shared
                                 .motor
-                                .lock(|m| m.set_duty_clamp(config.max_duty_clamp));
+                                .lock(|m| m.set_max_demand(config.max_duty_clamp));
                             cx.shared.run_config.lock(|rc| *rc = Some(config));
                             cx.shared.last_fault.lock(|f| *f = None);
                             cx.shared.state.lock(|s| *s = STATE::CONFIGURED);
@@ -447,7 +448,7 @@ mod app {
                             defmt::info!("Reconfigure received");
                             cx.shared
                                 .motor
-                                .lock(|m| m.set_duty_clamp(config.max_duty_clamp));
+                                .lock(|m| m.set_max_demand(config.max_duty_clamp));
                             cx.shared.run_config.lock(|rc| *rc = Some(config));
                         }
                         Some(Command::Stop) => {
@@ -470,7 +471,7 @@ mod app {
 
                     if let Some(Command::Stop) = received_cmd {
                         defmt::info!("STOP during calibration");
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         *cx.local.calibrator = None;
@@ -490,7 +491,7 @@ mod app {
                         }
                     };
 
-                    cx.shared.motor.lock(|m| m.set_speed(out.duty));
+                    cx.shared.motor.lock(|m| m.set_demand(out.duty));
 
                     if let Some(res) = out.result {
                         if res.valid {
@@ -566,7 +567,7 @@ mod app {
                     *cx.local.run_elapsed_ms += dt_ms;
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -578,7 +579,7 @@ mod app {
                     if let Some(Command::LiveAdjust(param)) = received_cmd {
                         match param {
                             LiveParam::Duty(d) => {
-                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_demand(d));
                             }
                             LiveParam::TargetRpm(rpm) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -593,7 +594,7 @@ mod app {
                             LiveParam::MaxDutyClamp(clamp) => {
                                 cx.shared
                                     .motor
-                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
+                                    .lock(|m: &mut Motor| m.set_max_demand(clamp));
                             }
                             LiveParam::TargetFreqHz(hz) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -630,10 +631,10 @@ mod app {
                                 let trim = cx.local.pid.update(target_rpm, measured, dt_s);
                                 cx.shared
                                     .motor
-                                    .lock(|m| m.set_speed((ff + trim).clamp(0.0, 1.0)));
+                                    .lock(|m| m.set_demand((ff + trim).clamp(0.0, 1.0)));
                             }
                             _ => {
-                                cx.shared.motor.lock(|m| m.set_speed(val));
+                                cx.shared.motor.lock(|m| m.set_demand(val));
                             }
                         }
 
@@ -658,7 +659,7 @@ mod app {
                                 let measured = cx.shared.current_rpm.lock(|r| *r);
                                 let dt_s = dt_ms as f32 / 1000.0;
                                 let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
-                                cx.shared.motor.lock(|m| m.set_speed(output));
+                                cx.shared.motor.lock(|m| m.set_demand(output));
                             }
                             _ => {
                                 // OpenLoop holds whatever duty the ramp ended at
@@ -670,7 +671,7 @@ mod app {
                             && *cx.local.run_elapsed_ms >= config.ramp_up_ms + config.hold_ms
                         {
                             defmt::info!("Hold complete — ramping down");
-                            let speed = cx.shared.motor.lock(|m| m.speed());
+                            let speed = cx.shared.motor.lock(|m| m.demand());
                             *cx.local.ramp =
                                 Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                             cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -688,7 +689,7 @@ mod app {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -712,7 +713,7 @@ mod app {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -744,7 +745,7 @@ mod app {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -756,13 +757,13 @@ mod app {
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
                     let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
-                    cx.shared.motor.lock(|m| m.set_speed(output));
+                    cx.shared.motor.lock(|m| m.set_demand(output));
 
                     // Apply live adjustments
                     if let Some(Command::LiveAdjust(param)) = received_cmd {
                         match param {
                             LiveParam::Duty(d) => {
-                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_demand(d));
                             }
                             LiveParam::TargetRpm(rpm) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -777,7 +778,7 @@ mod app {
                             LiveParam::MaxDutyClamp(clamp) => {
                                 cx.shared
                                     .motor
-                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
+                                    .lock(|m: &mut Motor| m.set_max_demand(clamp));
                             }
                             LiveParam::TargetFreqHz(hz) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -811,7 +812,7 @@ mod app {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -822,13 +823,13 @@ mod app {
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
                     let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
-                    cx.shared.motor.lock(|m| m.set_speed(output));
+                    cx.shared.motor.lock(|m| m.set_demand(output));
 
                     // Apply live adjustments
                     if let Some(Command::LiveAdjust(param)) = received_cmd {
                         match param {
                             LiveParam::Duty(d) => {
-                                cx.shared.motor.lock(|m: &mut Motor| m.set_speed(d));
+                                cx.shared.motor.lock(|m: &mut Motor| m.set_demand(d));
                             }
                             LiveParam::TargetRpm(rpm) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -843,7 +844,7 @@ mod app {
                             LiveParam::MaxDutyClamp(clamp) => {
                                 cx.shared
                                     .motor
-                                    .lock(|m: &mut Motor| m.set_duty_clamp(clamp));
+                                    .lock(|m: &mut Motor| m.set_max_demand(clamp));
                             }
                             LiveParam::TargetFreqHz(hz) => {
                                 cx.shared.run_config.lock(|rc: &mut Cfg| {
@@ -872,7 +873,7 @@ mod app {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
 
                     if let Some(Command::Stop) = received_cmd {
-                        let speed = cx.shared.motor.lock(|m| m.speed());
+                        let speed = cx.shared.motor.lock(|m| m.demand());
                         *cx.local.ramp =
                             Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
                         cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
@@ -883,7 +884,7 @@ mod app {
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
                     let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
-                    cx.shared.motor.lock(|m| m.set_speed(output));
+                    cx.shared.motor.lock(|m| m.set_demand(output));
 
                     let error = (config.target_rpm - measured).abs();
                     if error < config.target_rpm * 0.02 {
@@ -899,10 +900,10 @@ mod app {
                 STATE::MANUAL => {
                     match received_cmd {
                         Some(Command::LiveAdjust(LiveParam::Duty(d))) => {
-                            cx.shared.motor.lock(|m| m.set_speed(d));
+                            cx.shared.motor.lock(|m| m.set_demand(d));
                         }
                         Some(Command::LiveAdjust(LiveParam::MaxDutyClamp(c))) => {
-                            cx.shared.motor.lock(|m| m.set_duty_clamp(c));
+                            cx.shared.motor.lock(|m| m.set_max_demand(c));
                         }
                         Some(Command::LiveAdjust(LiveParam::TargetRpm(rpm))) => {
                             cx.shared.run_config.lock(|rc| {
@@ -912,7 +913,7 @@ mod app {
                             });
                         }
                         Some(Command::Stop) => {
-                            let speed = cx.shared.motor.lock(|m| m.speed());
+                            let speed = cx.shared.motor.lock(|m| m.demand());
                             let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
                             *cx.local.ramp =
                                 Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
@@ -935,7 +936,7 @@ mod app {
                 STATE::RAMP_DOWN => {
                     if let Some(ref mut ramp) = cx.local.ramp {
                         let val = ramp.tick(dt_ms);
-                        cx.shared.motor.lock(|m| m.set_speed(val));
+                        cx.shared.motor.lock(|m| m.set_demand(val));
 
                         if ramp.is_done() {
                             defmt::info!("Ramp down complete → IDLE");
@@ -960,7 +961,7 @@ mod app {
 
                 // ─── FAULT ───
                 STATE::FAULT => {
-                    cx.shared.motor.lock(|m| m.force_off());
+                    cx.shared.motor.lock(|m| m.emergency_off());
                     cx.shared.relay.lock(|r| r.set_low());
 
                     cx.shared.ld3.lock(|l| l.set_high());
@@ -981,7 +982,7 @@ mod app {
 
                 // ─── ESTOP ───
                 STATE::ESTOP => {
-                    cx.shared.motor.lock(|m| m.force_off());
+                    cx.shared.motor.lock(|m| m.emergency_off());
                     cx.shared.relay.lock(|r| r.set_low());
 
                     static mut ESTOP_TICK: u32 = 0;
@@ -1055,7 +1056,7 @@ mod app {
                             ts_ms,
                             state: *state,
                             rpm: meas.rpm,
-                            duty_percent: motor.speed(),
+                            duty_percent: motor.demand(),
                             v_gen_rms: meas.v_gen_rms,
                             i_gen_rms: meas.i_gen_rms,
                             freq_gen_hz: meas.freq_gen_hz,
@@ -1094,7 +1095,7 @@ mod app {
                             defmt::info!(
                                 "RPM: {} DUTY: {}% STATE: {}",
                                 rpm as i32,
-                                (motor.speed() * 100.0) as i32,
+                                (motor.demand() * 100.0) as i32,
                                 state.as_str()
                             );
                         }
