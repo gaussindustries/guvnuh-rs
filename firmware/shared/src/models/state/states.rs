@@ -111,6 +111,7 @@ pub enum Fault {
     PllUnlock,
     SensorOutOfRange,
     CommLost,
+    Overspeed,
 }
 
 impl STATE {

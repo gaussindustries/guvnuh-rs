@@ -41,6 +41,7 @@ use esp_wifi::{
     },
     EspWifiController,
 };
+use shared::models::telemetry::telemetry::{Command, Uplink};
 
 const SSID: &str = env!("WIFI_SSID");
 const PASS: &str = env!("WIFI_PASS");
@@ -79,24 +80,17 @@ async fn main(spawner: Spawner) -> ! {
 
     println!("ESP32 Booted. Waiting for STM32 handshake...");
 
-    // --- HANDSHAKE ---
-    let mut buf = [0u8; 1];
-    let mut window = [0u8; 5];
-    loop {
-        if uart1.read(&mut buf).is_ok() {
-            window[0] = window[1];
-            window[1] = window[2];
-            window[2] = window[3];
-            window[3] = window[4];
-            window[4] = buf[0];
-            if &window == b"HELLO" {
-                uart1.write_all(b"OK\r\n").ok();
-                led.set_high();
-                println!("Handshake complete — STM32 is GO");
-                break;
-            }
+    // Announce our boot to the STM32 (framed). If the STM32 is already running,
+    // it will HelloAck and re-sync. If the STM32 is also booting, it's sending
+    // its own Hello which we answer in tcp_task.
+    {
+        use postcard::to_slice_cobs;
+        let mut buf = [0u8; 16];
+        if let Ok(enc) = to_slice_cobs(&Command::Hello, &mut buf) {
+            uart1.write_all(enc).ok();
         }
     }
+    println!("ESP32 booted — sent Hello to STM32");
 
     // --- WIFI INIT ---
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -212,7 +206,7 @@ async fn tcp_task(
         led.set_high();
 
         'conn: loop {
-            // UART -> TCP: drain ALL available bytes, not one per iteration
+            // UART -> TCP: drain ALL available bytes; intercept Hello frames.
             let mut chunk = [0u8; 64];
             match uart.read(&mut chunk) {
                 Ok(n) if n > 0 => {
@@ -220,11 +214,32 @@ async fn tcp_task(
                     for &b in &chunk[..n] {
                         if b == 0x00 {
                             if cobs_len > 0 {
-                                if socket.write_all(&cobs_buf[..cobs_len]).await.is_err() {
-                                    break 'conn;
-                                }
-                                if socket.write_all(&[0x00]).await.is_err() {
-                                    break 'conn;
+                                // Try to decode as Uplink to intercept handshake.
+                                let mut frame_copy = cobs_buf[..cobs_len].to_vec();
+                                let is_hello = matches!(
+                                    postcard::from_bytes_cobs::<Uplink>(&mut frame_copy),
+                                    Ok(Uplink::Hello)
+                                );
+
+                                if is_hello {
+                                    // STM32 (re)started — answer locally, don't
+                                    // bother the server. Send framed HelloAck.
+                                    let mut ack = [0u8; 16];
+                                    if let Ok(enc) =
+                                        postcard::to_slice_cobs(&Command::HelloAck, &mut ack)
+                                    {
+                                        uart.write_all(enc).ok();
+                                    }
+                                    println!("STM32 Hello — sent HelloAck locally");
+                                    // Do NOT forward Hello to the server.
+                                } else {
+                                    // Normal telemetry/calibration — forward to TCP.
+                                    if socket.write_all(&cobs_buf[..cobs_len]).await.is_err() {
+                                        break 'conn;
+                                    }
+                                    if socket.write_all(&[0x00]).await.is_err() {
+                                        break 'conn;
+                                    }
                                 }
                                 cobs_len = 0;
                             }

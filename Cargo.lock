@@ -897,6 +897,7 @@ dependencies = [
  "esp-hal-embassy",
  "esp-println",
  "esp-wifi",
+ "postcard",
  "shared",
  "smoltcp",
  "static_cell",

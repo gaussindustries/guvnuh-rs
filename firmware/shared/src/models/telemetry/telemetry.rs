@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub enum Uplink {
     Telemetry(Telemetry),
     Calibration(CalibrationReport),
+    Hello,    // STM32 announces (re)start — "are you there?"
+    HelloAck, // STM32 acknowledges the ESP32's Hello
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -162,7 +164,7 @@ pub struct Setpoints {
     pub v_rms: f32,
 }
 
-/// Commands from desktop → gaussindustri.es → ESP32 → STM32
+/// Commands from desktop → gaussindustri.es server → ESP32 → STM32
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Command {
     Ping,
@@ -173,4 +175,6 @@ pub enum Command {
     LiveAdjust(LiveParam),
     Set(Setpoints),
     ClearFaults,
+    Hello,    // ESP32 announces (re)start — "are you there?"
+    HelloAck, // ESP32 acknowledges the STM32's Hello — "yes, I'm here"
 }

@@ -42,7 +42,28 @@ fn cmd_name(c: &Command) -> &'static str {
         Command::LiveAdjust(_) => "LiveAdjust",
         Command::Set(_) => "Set",
         Command::ClearFaults => "ClearFaults",
+        Command::Hello => "Hello",
+        Command::HelloAck => "HelloAck",
     }
+}
+
+// ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
+/// Active from boot with zero config — the autonomous-mode ceiling.
+pub const OVERSPEED_LIMIT_DEFAULT: f32 = 750.0;
+/// Absolute bounds any server-commanded limit is clamped to. The server can
+/// never disable protection nor set an instant-trip value.
+pub const OVERSPEED_LIMIT_MIN: f32 = 500.0;
+pub const OVERSPEED_LIMIT_MAX: f32 = 3000.0; // ← true mechanical never-exceed
+/// RPM readings outside this window (or non-finite) mean the sensor is lying.
+pub const RPM_PLAUSIBLE_MAX: f32 = 4000.0;
+
+/// Clamp a server-commanded overspeed limit into the safe envelope.
+#[inline]
+pub fn clamp_overspeed_limit(requested: f32) -> f32 {
+    if !requested.is_finite() {
+        return OVERSPEED_LIMIT_DEFAULT;
+    }
+    requested.clamp(OVERSPEED_LIMIT_MIN, OVERSPEED_LIMIT_MAX)
 }
 
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
@@ -81,6 +102,11 @@ mod app {
         pub measurements: crate::models::measurements::Measurements,
         pub calibration: Option<crate::guv::calibrate::CalResult>,
         pub pending_report: Option<shared::models::telemetry::telemetry::CalibrationReport>,
+
+        /// Overspeed trip ceiling. Boots at the compiled default so protection
+        /// is active with zero config; the command path may later set it (clamped).
+        /// Comms loss never removes it — the local supervisor keeps enforcing it.
+        pub overspeed_limit: f32,
     }
 
     #[local]
@@ -92,6 +118,7 @@ mod app {
         ramp: Option<crate::guv::ramp::Ramp>,
         run_elapsed_ms: u32,
         calibrator: Option<crate::guv::calibrate::Calibrator>,
+        boot_hello_attempts: u32,
     }
 
     #[init]
@@ -112,6 +139,7 @@ mod app {
 
         state_manager::spawn().ok();
         telemetry_task::spawn().ok();
+        safety_supervisor::spawn().ok();
 
         board.ld3.set_high(); // Red = booting
 
@@ -133,6 +161,7 @@ mod app {
                 calibration: None,
                 pending_report: None,
                 measurements: crate::models::measurements::Measurements::default(),
+                overspeed_limit: crate::OVERSPEED_LIMIT_DEFAULT,
             },
             Local {
                 safety_init_done: false,
@@ -142,16 +171,73 @@ mod app {
                 ramp: None,
                 run_elapsed_ms: 0,
                 calibrator: None,
+                boot_hello_attempts: 0,
             },
         )
     }
+    // ────────────────────────────────────────────
+    //  Safety Supervisor — independent, comms-agnostic, PREEMPTIVE
+    //  Priority 2: preempts state_manager & telemetry (both pri 1). Runs at
+    //  500 Hz — 5× the control loop — so overspeed is caught fast. Reads ONLY
+    //  local sensors; no dependency on ESP32 or server. This layer keeps the
+    //  machine safe even when everything upstream is dead.
+    // ────────────────────────────────────────────
+    #[task(priority = 2, shared = [current_rpm, overspeed_limit, motor, relay, state, last_fault, ld3])]
+    async fn safety_supervisor(mut cx: safety_supervisor::Context) {
+        const SUPERVISE_MS: u32 = 2; // 500 Hz
 
+        loop {
+            Mono::delay(SUPERVISE_MS.millis()).await;
+
+            let rpm = cx.shared.current_rpm.lock(|r| *r);
+            let limit = cx.shared.overspeed_limit.lock(|l| *l);
+
+            // ── evaluate LOCAL trip conditions (no comms involved) ──
+            let trip: Option<Fault> = if !rpm.is_finite() || rpm.abs() > crate::RPM_PLAUSIBLE_MAX {
+                Some(Fault::SensorOutOfRange)
+            } else if rpm > limit {
+                Some(Fault::Overspeed)
+            } else {
+                None
+            };
+
+            if let Some(fault) = trip {
+                // Actuators OFF first — fastest path to safe.
+                cx.shared.motor.lock(|m| m.force_off());
+                cx.shared.relay.lock(|r| r.set_low());
+
+                // Transition + log only on the EDGE (don't spam while coasting down).
+                let already_faulted = cx
+                    .shared
+                    .state
+                    .lock(|s| matches!(*s, STATE::FAULT | STATE::ESTOP));
+
+                if !already_faulted {
+                    cx.shared.last_fault.lock(|f| *f = Some(fault));
+                    cx.shared.state.lock(|s| *s = STATE::FAULT);
+                    cx.shared.ld3.lock(|l| l.set_high());
+
+                    if rpm > limit && rpm.is_finite() {
+                        defmt::error!(
+                            "!! OVERSPEED TRIP !! rpm={} limit={}",
+                            rpm as i32,
+                            limit as i32
+                        );
+                    } else {
+                        defmt::error!("!! SENSOR TRIP !! implausible rpm={}", rpm as i32);
+                    }
+                }
+                // Keep forcing off every cycle while faulted — the supervisor
+                // doesn't rely on state_manager running to hold safe.
+            }
+        }
+    }
     // ────────────────────────────────────────────
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
         shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report],
-        local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator]
+        local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
         let dt_ms: u32 = 10;
@@ -178,46 +264,88 @@ mod app {
                 continue;
             }
 
+            // ── ESP32 (re)start announcement — reply from ANY state ──
+            // The ESP32 rebooted and is re-announcing. Ack it so the link
+            // re-syncs, but DO NOT change state — the machine keeps doing
+            // exactly what it was doing. Comms absence never stopped us;
+            // comms return never disrupts us.
+            if let Some(Command::Hello) = received_cmd {
+                defmt::info!("ESP32 Hello — re-syncing link (state unchanged)");
+                cx.shared.tx.lock(|tx| {
+                    let mut buf = [0u8; 16];
+                    if let Ok(enc) = postcard::to_slice_cobs(&Uplink::HelloAck, &mut buf) {
+                        for b in enc.iter() {
+                            block!(tx.write(*b)).ok();
+                        }
+                    }
+                });
+                Mono::delay(dt_ms.millis()).await;
+                continue;
+            }
+
             // ── State machine ──
             match current_state {
-                // ─── BOOT: safety init + ESP32 handshake ───
+                // ─── BOOT: safety init + framed Hello handshake ───
                 STATE::BOOT => {
                     if !*cx.local.safety_init_done {
                         cx.shared.motor.lock(|m| m.force_off());
                         cx.shared.relay.lock(|r| r.set_low());
-                        defmt::info!("Safety init complete.");
+                        // Arm the RX ISR ONCE, up front. The handshake now flows
+                        // through the same COBS/command path as everything else,
+                        // so the ISR must be live to receive HelloAck. This ends
+                        // the old polling-vs-ISR conflict.
+                        cx.shared.rx.lock(|rx| rx.listen());
+                        defmt::info!("Safety init complete; RX armed.");
                         *cx.local.safety_init_done = true;
                     }
 
+                    // Announce ourselves: framed Uplink::Hello via TX.
                     cx.shared.tx.lock(|tx| {
-                        writeln!(tx, "HELLO\r").ok();
-                    });
-
-                    let got_ok = cx.shared.rx.lock(|rx| {
-                        let mut buf = [0u8; 4];
-                        let mut i = 0;
-                        while i < 4 {
-                            match rx.read() {
-                                Ok(b) => {
-                                    buf[i] = b;
-                                    i += 1;
-                                }
-                                Err(_) => break,
+                        let mut buf = [0u8; 16];
+                        if let Ok(enc) = postcard::to_slice_cobs(&Uplink::Hello, &mut buf) {
+                            for b in enc.iter() {
+                                block!(tx.write(*b)).ok();
                             }
                         }
-                        &buf[..i] == b"OK\r\n" || &buf[..i] == b"OK\r"
                     });
 
-                    if got_ok {
-                        defmt::info!("Handshake OK — entering IDLE");
-                        // Arm the RX interrupt now (after handshake, so the ISR
-                        // doesn't eat the OK response above).
-                        cx.shared.rx.lock(|rx| rx.listen());
+                    // Did a HelloAck land in the command queue? (ISR decoded it.)
+                    // Drain it out; leave any other queued commands intact.
+                    let acked = cx.shared.cmd_in.lock(|q| {
+                        let mut found = false;
+                        let mut keep: heapless::Deque<Command, 8> = heapless::Deque::new();
+                        while let Some(c) = q.pop_front() {
+                            if matches!(c, Command::HelloAck) {
+                                found = true;
+                            } else {
+                                let _ = keep.push_back(c);
+                            }
+                        }
+                        *q = keep;
+                        found
+                    });
+
+                    if acked {
+                        defmt::info!("HelloAck received — entering IDLE");
+                        *cx.local.boot_hello_attempts = 0;
+                        cx.shared.ld3.lock(|l| l.set_low());
+                        cx.shared.ld2.lock(|l| l.set_high());
+                        cx.shared.state.lock(|s| *s = STATE::IDLE);
+                    } else if *cx.local.boot_hello_attempts >= 100 {
+                        // ~1s of retries with no ack. Proceed anyway — a dead or
+                        // still-booting ESP32 must NOT brick us in BOOT. When the
+                        // ESP32 comes up it will send its own Hello, which the
+                        // mid-run handler acks and the link attaches.
+                        defmt::warn!(
+                            "No HelloAck after 1s — proceeding to IDLE, comms will attach later"
+                        );
+                        *cx.local.boot_hello_attempts = 0;
                         cx.shared.ld3.lock(|l| l.set_low());
                         cx.shared.ld2.lock(|l| l.set_high());
                         cx.shared.state.lock(|s| *s = STATE::IDLE);
                     } else {
-                        cx.shared.ld3.lock(|l| l.toggle());
+                        *cx.local.boot_hello_attempts += 1;
+                        cx.shared.ld3.lock(|l| l.toggle()); // blink red while trying
                     }
                 }
 
