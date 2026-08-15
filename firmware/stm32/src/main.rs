@@ -49,7 +49,7 @@ fn cmd_name(c: &Command) -> &'static str {
 
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
 /// Active from boot with zero config — the autonomous-mode ceiling.
-pub const OVERSPEED_LIMIT_DEFAULT: f32 = 750.0;
+pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2800.0;
 /// Absolute bounds any server-commanded limit is clamped to. The server can
 /// never disable protection nor set an instant-trip value.
 pub const OVERSPEED_LIMIT_MIN: f32 = 500.0;
