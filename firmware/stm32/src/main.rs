@@ -71,7 +71,7 @@ pub fn clamp_overspeed_limit(requested: f32) -> f32 {
 #[app(device = stm32h7xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
     use super::*;
-    use shared::models::telemetry::telemetry::Uplink;
+    use shared::models::telemetry::telemetry::{Uplink, DEFAULT_PROFILE};
     use stm32h7xx_hal::qei::Qei;
     type Motor = crate::guv::motor::MotorController;
     type Cfg = Option<RunConfig>;
@@ -169,7 +169,7 @@ mod app {
                 pending_report: None,
                 measurements: crate::models::measurements::Measurements::default(),
                 overspeed_limit: crate::OVERSPEED_LIMIT_DEFAULT,
-                active_profile: None,
+                active_profile: Some(DEFAULT_PROFILE),
             },
             Local {
                 safety_init_done: false,

@@ -4,6 +4,10 @@
 ![Guv'nuh Live Demo](githubMedia/preview_v6.gif)
 > This is showing the calibration step, please see below for HQ screen shot
 
+![Guv'nuh Chart Profile Showcase](githubMedia/profile.png)
+
+> This is showing the profile being executed showing planned vs actual rpm in this case
+
 ![Guv'nuh Showcase](githubMedia/V1_Showcase.png)
 > August 13th (this is going to be as tidy as the left hand side once completed)
 
@@ -42,13 +46,16 @@ hard real-time safety (STM32/RTIC) with secure cloud telemetry
 | **F-08** | Live Parameter Adjustment | Duty / RPM / PID gains adjustable mid-run | ✅ Complete |
 | **F-09** | Interrupt-Driven Command RX | Overrun-free UART command reception | ✅ Complete |
 | **F-10** | Trial Run Recording | Per-trial telemetry to SurrealDB | ✅ Complete |
-| **F-11** | Telemetry Visualization | Plotly.js time-series with metric toggles | ✅ Complete |
+| **F-11** | Telemetry Visualization | Custom SVG chart primitives, multi-series + metric toggles | ✅ Complete |
 | **F-12** | REST Hardware API | Stateless control + data endpoints on :3001 | ✅ Complete |
 | **F-13** | Duty→RPM Calibration | On-device least-squares fit with validation | ✅ Complete |
 | **F-14** | Feedforward Control | Calibration coefficient seeds PID duty | ✅ Complete |
 | **F-15** | Calibration Reporting | Fit + raw points persisted, drift-tracked | ✅ Complete |
 | **F-16** | Independent Safety Supervisor | Preemptive overspeed + sensor-plausibility trip, comms-independent | ✅ Complete |
 | **F-17** | Fault History & Auto-Close | Faults persisted per-trial; faulted trials self-close | ✅ Complete |
+| **F-18** | Setpoint-Profile Trajectories | Sparse `(t, target)` breakpoints executed on-device; commanded-vs-actual overlay | ✅ Complete |
+| **F-19** | Profile Library | Named profiles persisted to SurrealDB, upsert-by-name, load into editor | ✅ Complete |
+| **F-20** | Prime-Mover Abstraction | `PrimeMover` trait decouples control from actuator (DC motor ↔ turbine) | ✅ Complete |
 
 ### Phase 2 — EtherCAT Integration
 
@@ -149,14 +156,17 @@ sequencing states advance on measured conditions, not just spin.
 │                                                              │
 │   Desktop Terminal (Dioxus Desktop)                          │
 │       ├── Tabs: Control / Calibration / Trials               │
-│       ├── Run Configurator: RunMode + params + presets       │
+│       ├── Mode-Driven Console: setpoint source swaps by mode │
+│       │     Manual / OpenLoop / ClosedLoop / Profile / Cal   │
+│       ├── Profile Editor: draggable SVG trajectory + library │
 │       ├── Trial Control: Configure→Start / Stop / E-Stop     │
 │       ├── Clear Faults: recover FAULT/ESTOP → IDLE           │
 │       ├── Live Control: real-time duty adjustment (Manual)   │
 │       ├── Calibration Panel: fit stats + points + fit chart  │
 │       ├── Connection Status: ESP32 + Server + STM32 state    │
 │       ├── Trials Dashboard: accordion list + fault strip     │
-│       └── Plotly.js Charts: RPM, V, I, Freq, Temp, DC Bus   │
+│       └── Custom SVG Charts: LineChart + ScatterChart,       │
+│             viewport zoom/pan, RPM/V/I/Freq/Temp/DC Bus      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -269,20 +279,42 @@ sequencing states advance on measured conditions, not just spin.
 
 - **Role:** The "Operator Console."
 - **Tabbed Layout:** Control, Calibration, and Trials, each a focused panel.
-- **Run Configurator:** Select a `RunMode`, set target RPM, ramp/hold timings,
-  PID gains (with hover tooltips explaining each term), and a max-duty safety
-  clamp — or apply a named **preset** with one click. The full `RunConfig` is
-  sent as a prelude before the run begins.
-- **Trial Control:** Start sends `Configure` then `Start`; Stop ramps down
-  gracefully; a dedicated Calibrate button runs the calibration preset; an
-  always-available **E-Stop** kills the motor immediately. When the hardware is
-  in `FAULT`/`ESTOP`, a **Clear Faults** button (state-gated on the live STM32
-  state) sends `ClearFaults` to return to `IDLE` before another run.
+- **Mode-Driven Control Console:** One console where the selected **mode**
+  (Manual / OpenLoop / ClosedLoop / Profile / Calibrate) is the *setpoint
+  source* — the panel swaps only the setpoint-editor region while the status
+  bar, PID gains, max-duty clamp, and run controls stay constant. PID gains
+  carry hover tooltips explaining each term; a named **preset** can be applied
+  with one click. The full `RunConfig` is sent as a prelude before the run.
+- **Setpoint-Profile Editor:** In Profile mode, a custom draggable SVG chart
+  defines a speed trajectory as sparse `(t, target)` breakpoints with per-
+  segment interpolation (linear ramp or step hold) and an end behavior (hold /
+  stop / loop). The profile — not ramp/hold timings — owns the run's timing.
+  A bidirectional breakpoint table edits the same points. When a profile runs,
+  the chart switches to a **commanded-vs-actual overlay**: the planned
+  trajectory (dashed) over the live actual RPM (solid), elapsed-time aligned, so
+  the PID's tracking of the curve is visible in real time.
+- **Profile Library:** Named profiles are saved to SurrealDB (upsert-by-name)
+  and loaded back into the editor from an inline picker, with a confirm dialog
+  guarding unsaved edits. The library stores the real breakpoints; the fixed-
+  size array padding is a firmware-wire concern only.
+- **Trial Control:** Start sends `Configure` then `Start` (or pushes the profile
+  then starts a closed-loop trial); Stop ramps down gracefully; a dedicated
+  Calibrate mode runs the calibration routine; an always-available **E-Stop**
+  kills the motor immediately. When the hardware is in `FAULT`/`ESTOP`, a
+  **Clear Faults** button (state-gated on the live STM32 state) sends
+  `ClearFaults` to return to `IDLE` before another run.
 - **Live Control:** In Manual mode, a duty slider streams real-time
   `LiveAdjust(Duty)` commands to the motor while it runs.
+- **Custom Chart Primitives:** All charting is done by two reusable in-house SVG
+  components (no external charting library) — `LineChart` (multi-series, dual
+  y-axis) and `ScatterChart` (markers + error bars + fit overlay). Both are
+  **viewport-driven**: scroll to zoom (shift = X-only, ctrl = Y-only), drag to
+  pan, double-click to reset, with an auto-follow mode that tracks live data
+  until the operator interacts. A shared `ChartControls` widget provides zoom/fit
+  buttons for any chart.
 - **Calibration Panel:** Shows the latest fit with a validity banner, the fit
   statistics (`k`, intercept, max RPM, r²), the sampled points table, and a
-  Plotly scatter of the points with per-point standard-deviation error bars and
+  `ScatterChart` of the points with per-point standard-deviation error bars and
   the fitted line superimposed. A history table tracks the coefficient and fit
   quality across runs to surface mechanical drift over time.
 - **State-Aware Trials:** The terminal reads the live STM32 state and closes a
@@ -292,9 +324,11 @@ sequencing states advance on measured conditions, not just spin.
   timestamps, and frame counts. Faulted trials are flagged (red dot + badge),
   and each trial's detail shows a **fault strip** — every fault that occurred,
   edge-triggered, with the timestamp it tripped, aligned to the RPM trace.
+  Charts export to **SVG** (vector) for reports.
 - **Metric Toggles:** RPM, Voltage RMS, Current RMS, Frequency, Temperature,
   DC Bus Voltage — each independently toggleable with dual y-axes.
-- **Export:** One-click PNG export of charts for reports and client deliverables.
+- **Export:** One-click **SVG** (vector) export of charts for reports and client
+  deliverables — crisp at any scale, no raster dependency.
 
 ---
 
@@ -577,7 +611,7 @@ pub enum LiveParam {
 | **Transport** | UART (3.3V) + TCP/WiFi | Hardware isolation between domains |
 | **Backend** | Axum + SurrealDB (raw `/sql`) | Type-safe async Rust API |
 | **Frontend** | Dioxus Fullstack + Desktop | Shared types from firmware to UI |
-| **Visualization** | Plotly.js | Interactive charts, PNG export for reports |
+| **Visualization** | Custom SVG (in-house) | `LineChart` + `ScatterChart`, viewport zoom/pan, SVG export |
 | **Desktop** | Dioxus Desktop + reqwest | Native operator console |
 | **Safety (future)** | Hardware overspeed trip + Watchdog | Fail-safe torque-off independent of software (design target: SIL-2) |
 
@@ -599,13 +633,25 @@ pub enum LiveParam {
 │   │       │                    telemetry task, framed handshake
 │   │       ├── models/        ↳ Measurements (shared sensor struct)
 │   │       └── guv/
-│   │           ├── motor.rs      ↳ MotorController (inverted PWM abstraction)
+│   │           ├── prime_mover.rs ↳ PrimeMover trait (actuator abstraction seam)
+│   │           ├── motor.rs      ↳ MotorController: impl PrimeMover (inverted PWM)
+│   │           ├── turbine.rs    ↳ TurbineController skeleton (impl PrimeMover, stub)
 │   │           ├── pid.rs        ↳ PID controller (anti-windup, hot-swap gains)
 │   │           ├── ramp.rs       ↳ Linear ramp generator
+│   │           ├── profile.rs    ↳ SetpointProfile + eval_profile (trajectory exec)
 │   │           ├── calibrate.rs  ↳ Calibrator: duty→RPM fit, validation, feedforward
 │   │           └── states/       ↳ boot, calibrate, idle, estop, fault...
 │   └── esp32/                 ↳ Telemetry Gateway (esp-hal, no_std)
 │       └── src/main.rs        ↳ Framed handshake, WiFi, TCP server, UART bridge
+├── gaussindustri.es/          ↳ Fullstack server + desktop terminal (Dioxus 0.7)
+│   └── src/
+│       ├── backend/           ↳ Axum REST API, SurrealDB (raw /sql), live buffer
+│       ├── components/
+│       │   └── chart.rs       ↳ LineChart + ScatterChart + Viewport + ChartControls
+│       └── views/
+│           ├── control.rs     ↳ Mode-driven console + profile editor + overlay
+│           ├── trials.rs      ↳ Trials dashboard, custom charts, fault strip
+│           └── calibration.rs ↳ Fit panel, ScatterChart with error bars
 ├── docs/
 │   ├── 00_requirements/       ↳ Project Charter
 │   ├── 45_µcu_reference/      ↳ STM32H753 + ESP32-WROOM datasheets
@@ -649,20 +695,35 @@ pub enum LiveParam {
 - ✅ Clear Faults from the terminal — recover `FAULT`/`ESTOP` → `IDLE`
 - ✅ REST API on :3001 (status, configure, start, adjust, stop, clear, estop,
      live, trials, calibration)
-- ✅ Desktop terminal with tabbed layout, run configurator, presets, PID tooltips
-- ✅ Calibration panel — fit stats, points table, fit chart with error bars
-- ✅ Trials dashboard with accordion, Plotly.js charts, metric toggles, fault strip
-- ✅ PNG export for client reports
+- ✅ Desktop terminal — unified mode-driven console (setpoint source swaps by mode)
+- ✅ Setpoint-profile system — on-device trajectory execution (`eval_profile`),
+     draggable SVG editor, commanded-vs-actual live overlay
+- ✅ Profile library — named profiles persisted to SurrealDB (upsert-by-name),
+     loaded back into the editor with an unsaved-edits confirm dialog
+- ✅ Prime-mover abstraction — `PrimeMover` trait decouples control from the
+     actuator; `MotorController` implements it, turbine skeleton stubbed against it
+- ✅ Custom SVG chart primitives — `LineChart` (multi-series, dual-axis) +
+     `ScatterChart` (markers, error bars, fit); no external charting dependency
+- ✅ Viewport zoom/pan on all charts — scroll-zoom (shift=X, ctrl=Y), drag-pan,
+     auto-follow-then-lock, shared `ChartControls` widget
+- ✅ Calibration panel — fit stats, points table, `ScatterChart` with error bars
+- ✅ Trials dashboard with accordion, custom charts, metric toggles, fault strip
+- ✅ SVG (vector) export for client reports
 
 ### In Progress
 
 - 🔄 PID closed-loop tuning **with feedforward enabled** (gains re-tuned lower)
-- 🔄 Load rejection detection + recovery logic
-- 🔄 ADC sensor integration (voltage, current, frequency) — the gate for real
-     SEIG excitation sensing and the AVR/current-limit loops
-- 🔄 SEIG capacitor bank + rectifier + switched DC load (physical build)
+- 🔄 ADC sensing front-end — **INA240** (current, shunt) + **ADS131M04**
+     (4-ch simultaneous-sampling ADC) into the `Measurements` struct. This is the
+     keystone: it turns four currently-stubbed features real at once — the
+     guard-conditioned transitions, real EXCITE sensing, the AVR loop
+     (`target_v_rms`), and current limiting (`max_amperage_clamp`).
+- 🔄 SEIG capacitor bank + rectifier + switched DC load (physical build) —
+     gated on the incoming PSU; recalibrate **loaded** once built (current `k`
+     was measured unloaded)
 - 🔄 Full generator sequence (EXCITE / PLL_LOCK / READY / GENERATE) on measured
-     conditions rather than time-based placeholders
+     conditions rather than time-based placeholders (follows the ADC front-end)
+- 🔄 Load rejection detection + recovery logic
 - 🔄 Live WebSocket telemetry dashboard (web frontend)
 - 🔄 VPS deployment with TLS
 
@@ -672,11 +733,9 @@ pub enum LiveParam {
      software (the eventual SIL-2 layer beneath the software supervisor)
 - 📋 Server-settable overspeed ceiling (clamped to compiled bounds) with a red
      trip-line on the live chart
-- 📋 Setpoint-profile trajectories — sparse `(t, target)` breakpoints executed on
-     the STM32 at loop rate, commanded-vs-actual overlaid on the chart
-- 📋 `PrimeMover` abstraction — `set_demand` / `emergency_off` so motor↔turbine
-     swaps without touching the control loop
-- 📋 Guard-conditioned state transitions over validated `Measurements`
+- 📋 Guard-conditioned state transitions over validated `Measurements` — the
+     EXCITE→PLL_LOCK→READY predicates (deferred until measurable measurements
+     exist, i.e. after the ADC front-end)
 - 📋 Sensor validity tagging (per-reading valid/stale) for diagnostic coverage
 - 📋 Dedicated `measurement` task (ADC sampling) feeding `Measurements`
 - 📋 Server-computed nonlinear feedforward map pushed via `Configure` prelude
