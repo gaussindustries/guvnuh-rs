@@ -4,6 +4,8 @@
 ![Guv'nuh Live Demo](githubMedia/preview_v6.gif)
 > This is showing the calibration step, please see below for HQ screen shot
 
+
+![Guv'nuh Chart Profile Showcase](githubMedia/profile0.png)
 ![Guv'nuh Chart Profile Showcase](githubMedia/profile.png)
 
 > This is showing the profile being executed showing planned vs actual rpm in this case
