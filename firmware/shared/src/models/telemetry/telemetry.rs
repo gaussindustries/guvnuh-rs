@@ -177,4 +177,181 @@ pub enum Command {
     ClearFaults,
     Hello,    // ESP32 announces (re)start — "are you there?"
     HelloAck, // ESP32 acknowledges the STM32's Hello — "yes, I'm here"
+    LoadProfile(SetpointProfile),
 }
+
+/// Max breakpoints in a profile. Bounds RAM: each ProfilePoint is ~12 bytes,
+/// so 16 points ≈ 192 bytes on the wire and in STM32 shared state. Start at 16;
+/// raise once the mechanic is proven.
+pub const MAX_PROFILE_POINTS: usize = 16;
+
+pub const PROFILE_CMD_BUF: usize = core::mem::size_of::<Command>() + 64;
+
+/// How the segment LEAVING a point behaves — carried per-point so a single
+/// profile can ramp between some points and step between others.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SegmentInterp {
+    /// Linear ramp from this point's value to the next point's value.
+    Linear,
+    /// Hold this point's value until the next point's time, then jump.
+    Step,
+}
+
+/// What happens once elapsed time passes the LAST breakpoint.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EndBehavior {
+    /// Hold the final point's value forever — until Stop / EStop.
+    /// This is "hold indefinitely".
+    HoldLast,
+    /// Profile is done — the control loop should ramp down / finish.
+    Stop,
+    /// Restart the profile from t=0 (elapsed wraps modulo total_ms).
+    Loop,
+}
+
+/// One breakpoint. `interp` describes the segment from THIS point to the next
+/// (ignored on the final point — the tail is governed by EndBehavior).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProfilePoint {
+    pub t_ms: u32,
+    pub target_rpm: f32,
+    pub interp: SegmentInterp,
+}
+
+impl Default for ProfilePoint {
+    fn default() -> Self {
+        Self {
+            t_ms: 0,
+            target_rpm: 0.0,
+            interp: SegmentInterp::Linear,
+        }
+    }
+}
+
+/// A setpoint trajectory: sparse breakpoints the STM32 interpolates at loop rate.
+/// Fixed-size array (shared is no_std). `count` valid points, the rest padding.
+/// Points MUST be sorted by t_ms ascending (the editor guarantees this; eval
+/// assumes it).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SetpointProfile {
+    pub points: [ProfilePoint; MAX_PROFILE_POINTS],
+    pub count: u8,
+    pub end_behavior: EndBehavior,
+    /// Time of the last breakpoint (cached; == points[count-1].t_ms). Used for
+    /// Loop wrap and to know when the tail behavior kicks in.
+    pub total_ms: u32,
+}
+
+impl Default for SetpointProfile {
+    fn default() -> Self {
+        Self {
+            points: [ProfilePoint::default(); MAX_PROFILE_POINTS],
+            count: 0,
+            end_behavior: EndBehavior::HoldLast,
+            total_ms: 0,
+        }
+    }
+}
+
+/// Evaluate the profile at `elapsed_ms`, returning the current target RPM.
+/// Assumes points are sorted ascending by t_ms. Pure function — no state.
+pub fn eval_profile(profile: &SetpointProfile, elapsed_ms: u32) -> f32 {
+    let n = profile.count as usize;
+    if n == 0 {
+        return 0.0;
+    }
+    let pts = &profile.points[..n];
+
+    // Single point: hold its value (nothing to interpolate).
+    if n == 1 {
+        return pts[0].target_rpm;
+    }
+
+    // Resolve elapsed against the tail behavior.
+    let last_t = pts[n - 1].t_ms;
+    let t = if elapsed_ms >= last_t {
+        match profile.end_behavior {
+            EndBehavior::HoldLast => return pts[n - 1].target_rpm, // hold forever
+            EndBehavior::Stop => return pts[n - 1].target_rpm,     // caller detects done separately
+            EndBehavior::Loop => {
+                if profile.total_ms == 0 {
+                    return pts[n - 1].target_rpm;
+                }
+                elapsed_ms % profile.total_ms // wrap
+            }
+        }
+    } else {
+        elapsed_ms
+    };
+
+    // Before the first point: hold the first value.
+    if t <= pts[0].t_ms {
+        return pts[0].target_rpm;
+    }
+
+    // Find the segment [a, b] containing t.
+    for i in 0..n - 1 {
+        let a = pts[i];
+        let b = pts[i + 1];
+        if t >= a.t_ms && t <= b.t_ms {
+            return match a.interp {
+                SegmentInterp::Step => a.target_rpm, // hold a until b
+                SegmentInterp::Linear => {
+                    let span = (b.t_ms - a.t_ms) as f32;
+                    if span <= 0.0 {
+                        b.target_rpm
+                    } else {
+                        let frac = (t - a.t_ms) as f32 / span;
+                        a.target_rpm + frac * (b.target_rpm - a.target_rpm)
+                    }
+                }
+            };
+        }
+    }
+
+    // Fallback (shouldn't reach — t is within [first, last] by construction).
+    pts[n - 1].target_rpm
+}
+
+/// Has a `Stop`-terminated profile finished? (For the control loop to know when
+/// to ramp down. HoldLast/Loop never "finish".)
+pub fn profile_finished(profile: &SetpointProfile, elapsed_ms: u32) -> bool {
+    profile.count > 0 && profile.end_behavior == EndBehavior::Stop && elapsed_ms >= profile.total_ms
+}
+
+/// Compiled-in demo profile: ramp 0→1500 over 5s, hold 1500 for 20s, ramp
+/// 1500→1800 over 5s, hold 1800 (the 60 Hz target) indefinitely. Runs when no
+/// profile is loaded. Tune on hardware.
+pub const DEFAULT_PROFILE: SetpointProfile = SetpointProfile {
+    points: {
+        let mut p = [ProfilePoint {
+            t_ms: 0,
+            target_rpm: 0.0,
+            interp: SegmentInterp::Linear,
+        }; MAX_PROFILE_POINTS];
+        p[0] = ProfilePoint {
+            t_ms: 0,
+            target_rpm: 0.0,
+            interp: SegmentInterp::Linear,
+        };
+        p[1] = ProfilePoint {
+            t_ms: 5000,
+            target_rpm: 1500.0,
+            interp: SegmentInterp::Linear,
+        };
+        p[2] = ProfilePoint {
+            t_ms: 25000,
+            target_rpm: 1500.0,
+            interp: SegmentInterp::Linear,
+        };
+        p[3] = ProfilePoint {
+            t_ms: 30000,
+            target_rpm: 1800.0,
+            interp: SegmentInterp::Linear,
+        };
+        p
+    },
+    count: 4,
+    end_behavior: EndBehavior::HoldLast, // hold 1800 forever until Stop
+    total_ms: 30000,
+};

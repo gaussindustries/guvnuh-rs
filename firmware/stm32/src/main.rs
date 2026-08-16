@@ -45,6 +45,7 @@ fn cmd_name(c: &Command) -> &'static str {
         Command::ClearFaults => "ClearFaults",
         Command::Hello => "Hello",
         Command::HelloAck => "HelloAck",
+        Command::LoadProfile(_) => "LoadProfile",
     }
 }
 
@@ -108,6 +109,11 @@ mod app {
         /// is active with zero config; the command path may later set it (clamped).
         /// Comms loss never removes it — the local supervisor keeps enforcing it.
         pub overspeed_limit: f32,
+
+        /// Active setpoint profile, if one is loaded. None = use static
+        /// target_rpm (backward compatible) OR the compiled DEFAULT_PROFILE for
+        /// a profile run — see the control-loop integration below.
+        pub active_profile: Option<shared::models::telemetry::telemetry::SetpointProfile>,
     }
 
     #[local]
@@ -163,6 +169,7 @@ mod app {
                 pending_report: None,
                 measurements: crate::models::measurements::Measurements::default(),
                 overspeed_limit: crate::OVERSPEED_LIMIT_DEFAULT,
+                active_profile: None,
             },
             Local {
                 safety_init_done: false,
@@ -237,7 +244,7 @@ mod app {
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report],
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile],
         local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
@@ -377,10 +384,15 @@ mod app {
                             cx.shared.ld2.lock(|l| l.set_low());
                             cx.shared.ld1.lock(|l| l.set_high());
                         }
+                        Some(Command::LoadProfile(profile)) => {
+                            defmt::info!("Profile loaded: {} points", profile.count);
+                            cx.shared.active_profile.lock(|p| *p = Some(profile));
+                        }
                         Some(Command::ClearFaults) => {
                             cx.shared.last_fault.lock(|f| *f = None);
                             defmt::info!("Faults cleared");
                         }
+
                         _ => {
                             // Slow yellow blink = idle
                             static mut IDLE_TICK: u32 = 0;
@@ -450,6 +462,10 @@ mod app {
                                 .motor
                                 .lock(|m| m.set_max_demand(config.max_duty_clamp));
                             cx.shared.run_config.lock(|rc| *rc = Some(config));
+                        }
+                        Some(Command::LoadProfile(profile)) => {
+                            defmt::info!("Profile loaded: {} points", profile.count);
+                            cx.shared.active_profile.lock(|p| *p = Some(profile));
                         }
                         Some(Command::Stop) => {
                             defmt::info!("Stop in CONFIGURED — back to IDLE");
@@ -561,10 +577,11 @@ mod app {
                     }
                 }
 
-                // ─── SPOOLUP: ramp motor to target RPM ───
+                // ─── SPOOLUP: ramp motor to target RPM (or walk a profile) ───
                 STATE::SPOOLUP => {
                     let config = cx.shared.run_config.lock(|rc| rc.unwrap_or_default());
                     *cx.local.run_elapsed_ms += dt_ms;
+                    let elapsed = *cx.local.run_elapsed_ms;
 
                     if let Some(Command::Stop) = received_cmd {
                         let speed = cx.shared.motor.lock(|m| m.demand());
@@ -613,21 +630,36 @@ mod app {
                         }
                     }
 
-                    // Ramp up
+                    // Is a setpoint profile loaded? If so it drives the target
+                    // directly (its own first segment handles ramp-in), and we
+                    // skip the classic ramp entirely for closed-loop modes.
+                    let has_profile = cx.shared.active_profile.lock(|ap| ap.is_some());
+
+                    // Ramp up (classic ramp — used when NO profile, or for the
+                    // open-loop / generate spool)
                     if let Some(ref mut ramp) = cx.local.ramp {
                         let val = ramp.tick(dt_ms);
                         match config.mode {
                             RunMode::ClosedLoop | RunMode::Generate => {
-                                let target_rpm = config.target_rpm * val;
+                                // Target: profile if loaded, else ramped static target.
+                                let target_rpm = if has_profile {
+                                    cx.shared.active_profile.lock(|ap| {
+                                        ap.as_ref().map_or(config.target_rpm, |p| {
+                                            shared::models::telemetry::telemetry::eval_profile(
+                                                p, elapsed,
+                                            )
+                                        })
+                                    })
+                                } else {
+                                    config.target_rpm * val
+                                };
                                 let measured = cx.shared.current_rpm.lock(|r| *r);
                                 let dt_s = dt_ms as f32 / 1000.0;
-
                                 let ff = cx
                                     .shared
                                     .calibration
                                     .lock(|c| c.and_then(|cal| cal.feedforward(target_rpm)))
                                     .unwrap_or(0.0);
-
                                 let trim = cx.local.pid.update(target_rpm, measured, dt_s);
                                 cx.shared
                                     .motor
@@ -637,11 +669,9 @@ mod app {
                                 cx.shared.motor.lock(|m| m.set_demand(val));
                             }
                         }
-
                         if ramp.is_done() {
                             *cx.local.ramp = None;
                             defmt::info!("Spoolup complete");
-
                             match config.mode {
                                 RunMode::Generate => {
                                     cx.shared.state.lock(|s| *s = STATE::EXCITE);
@@ -656,20 +686,51 @@ mod app {
                         // Post-ramp steady state for OpenLoop/ClosedLoop
                         match config.mode {
                             RunMode::ClosedLoop => {
+                                // Target: profile if loaded, else static.
+                                let target_rpm = cx.shared.active_profile.lock(|ap| {
+                                    ap.as_ref().map_or(config.target_rpm, |p| {
+                                        shared::models::telemetry::telemetry::eval_profile(
+                                            p, elapsed,
+                                        )
+                                    })
+                                });
                                 let measured = cx.shared.current_rpm.lock(|r| *r);
                                 let dt_s = dt_ms as f32 / 1000.0;
-                                let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
-                                cx.shared.motor.lock(|m| m.set_demand(output));
+                                let ff = cx
+                                    .shared
+                                    .calibration
+                                    .lock(|c| c.and_then(|cal| cal.feedforward(target_rpm)))
+                                    .unwrap_or(0.0);
+                                let trim = cx.local.pid.update(target_rpm, measured, dt_s);
+                                cx.shared
+                                    .motor
+                                    .lock(|m| m.set_demand((ff + trim).clamp(0.0, 1.0)));
                             }
                             _ => {
                                 // OpenLoop holds whatever duty the ramp ended at
                             }
                         }
 
-                        // Check hold timeout (0 = indefinite)
-                        if config.hold_ms > 0
-                            && *cx.local.run_elapsed_ms >= config.ramp_up_ms + config.hold_ms
+                        // Profile-driven termination: a Stop-terminated profile
+                        // that has run its course ramps down.
+                        let profile_done = cx.shared.active_profile.lock(|ap| {
+                            ap.as_ref().map_or(false, |p| {
+                                shared::models::telemetry::telemetry::profile_finished(p, elapsed)
+                            })
+                        });
+
+                        if profile_done {
+                            defmt::info!("Profile finished — ramping down");
+                            let speed = cx.shared.motor.lock(|m| m.demand());
+                            *cx.local.ramp =
+                                Some(crate::guv::ramp::Ramp::new(speed, 0.0, config.ramp_down_ms));
+                            cx.shared.state.lock(|s| *s = STATE::RAMP_DOWN);
+                        } else if !has_profile
+                            && config.hold_ms > 0
+                            && elapsed >= config.ramp_up_ms + config.hold_ms
                         {
+                            // Classic hold timeout (only when NO profile — a
+                            // profile governs its own duration via EndBehavior).
                             defmt::info!("Hold complete — ramping down");
                             let speed = cx.shared.motor.lock(|m| m.demand());
                             *cx.local.ramp =
@@ -679,7 +740,7 @@ mod app {
                     }
 
                     // LED: fast green blink during spoolup
-                    if (*cx.local.run_elapsed_ms / 100) % 2 == 0 {
+                    if (elapsed / 100) % 2 == 0 {
                         cx.shared.ld1.lock(|l| l.toggle());
                     }
                 }
