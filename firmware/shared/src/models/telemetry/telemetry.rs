@@ -18,8 +18,20 @@ pub enum Uplink {
     Calibration(CalibrationReport),
     Hello,    // STM32 announces (re)start — "are you there?"
     HelloAck, // STM32 acknowledges the ESP32's Hello
+    WcetReport(WcetReportData),
 }
 
+/// Number of states tracked in a WcetReport. Must match the firmware's STATE
+/// count and the terminal's decoding. Keep in sync with STATE.
+pub const N_STATES: usize = 14;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WcetReportData {
+    pub per_state_max_us: [f32; N_STATES],
+    pub per_state_mean_us: [f32; N_STATES],
+    pub global_max_us: f32,
+    pub period_us: f32,
+    pub samples: u32,
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CalibrationReport {
     pub ts_ms: u32,

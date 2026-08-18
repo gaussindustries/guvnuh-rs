@@ -20,16 +20,17 @@ use stm32h7xx_hal::{
 };
 
 use cortex_m::peripheral::scb::SystemHandler;
+use cortex_m::peripheral::{DCB, DWT};
 
 mod guv;
 mod models;
 
 use crate::guv::prime_mover::PrimeMover;
+use crate::guv::wcet::{CycleTimer, WcetTable};
 use crate::models::{measurements::Measurements, status::WorkerStatus};
 use nb::block;
 use shared::models::state::states::{Fault, STATE};
 use shared::models::telemetry::telemetry::{Command, LiveParam, PidGains, RunConfig, RunMode};
-
 systick_monotonic!(Mono, 1_000);
 
 /// Human-readable command name for defmt logging (Command doesn't derive defmt::Format).
@@ -49,6 +50,31 @@ fn cmd_name(c: &Command) -> &'static str {
     }
 }
 
+/// Map a STATE to a stable table index for WCET tracking. Order must be stable
+/// (append new states at the end) so banked numbers stay comparable.
+fn state_index(s: STATE) -> usize {
+    match s {
+        STATE::BOOT => 0,
+        STATE::CALIBRATE => 1,
+        STATE::IDLE => 2,
+        STATE::CONFIGURED => 3,
+        STATE::SPOOLUP => 4,
+        STATE::EXCITE => 5,
+        STATE::PLL_LOCK => 6,
+        STATE::READY => 7,
+        STATE::GENERATE => 8,
+        STATE::LOAD_REJECTION => 9,
+        STATE::RAMP_DOWN => 10,
+        STATE::MANUAL => 11,
+        STATE::FAULT => 12,
+        STATE::ESTOP => 13,
+    }
+}
+
+fn enable_cycle_counter(dcb: &mut DCB, dwt: &mut DWT) {
+    dcb.enable_trace(); // DEMCR.TRCENA = 1 (required for DWT)
+    dwt.enable_cycle_counter(); // DWT.CTRL.CYCCNTENA = 1
+}
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
 /// Active from boot with zero config — the autonomous-mode ceiling.
 pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2800.0;
@@ -114,6 +140,8 @@ mod app {
         /// target_rpm (backward compatible) OR the compiled DEFAULT_PROFILE for
         /// a profile run — see the control-loop integration below.
         pub active_profile: Option<shared::models::telemetry::telemetry::SetpointProfile>,
+
+        pub wcet: WcetTable,
     }
 
     #[local]
@@ -147,7 +175,9 @@ mod app {
         state_manager::spawn().ok();
         telemetry_task::spawn().ok();
         safety_supervisor::spawn().ok();
-
+        //for wcet calc
+        cx.core.DCB.enable_trace();
+        cx.core.DWT.enable_cycle_counter();
         board.ld3.set_high(); // Red = booting
 
         (
@@ -170,6 +200,7 @@ mod app {
                 measurements: crate::models::measurements::Measurements::default(),
                 overspeed_limit: crate::OVERSPEED_LIMIT_DEFAULT,
                 active_profile: Some(DEFAULT_PROFILE),
+                wcet: WcetTable::new(),
             },
             Local {
                 safety_init_done: false,
@@ -244,7 +275,7 @@ mod app {
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile],
+        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile, wcet],
         local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
@@ -290,6 +321,8 @@ mod app {
                 Mono::delay(dt_ms.millis()).await;
                 continue;
             }
+
+            let _wcet_timer = CycleTimer::start();
 
             // ── State machine ──
             match current_state {
@@ -1068,6 +1101,10 @@ mod app {
 
                 _ => {}
             }
+
+            let elapsed = _wcet_timer.stop();
+            let idx = state_index(current_state);
+            cx.shared.wcet.lock(|w| w.record(idx, elapsed));
 
             Mono::delay(dt_ms.millis()).await;
         }
