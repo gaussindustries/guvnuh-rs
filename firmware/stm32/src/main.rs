@@ -75,6 +75,7 @@ fn enable_cycle_counter(dcb: &mut DCB, dwt: &mut DWT) {
     dcb.enable_trace(); // DEMCR.TRCENA = 1 (required for DWT)
     dwt.enable_cycle_counter(); // DWT.CTRL.CYCCNTENA = 1
 }
+
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
 /// Active from boot with zero config — the autonomous-mode ceiling.
 pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2800.0;
@@ -84,6 +85,47 @@ pub const OVERSPEED_LIMIT_MIN: f32 = 500.0;
 pub const OVERSPEED_LIMIT_MAX: f32 = 3000.0; // ← true mechanical never-exceed
 /// RPM readings outside this window (or non-finite) mean the sensor is lying.
 pub const RPM_PLAUSIBLE_MAX: f32 = 4000.0;
+
+// ── Deadline monitoring (execution-time budget per control iteration) ──
+
+/// The control loop period in cycles. At SYSCLK_HZ and 100 Hz (10 ms):
+///   64_000_000 / 100 = 640_000 cycles per 10 ms period.
+/// Keep in sync with the loop rate (dt_ms) and SYSCLK.
+pub const CONTROL_PERIOD_CYCLES: u32 = crate::guv::wcet::SYSCLK_HZ / 100;
+
+/// Fraction of the period a state's execution may occupy before it counts as an
+/// overrun. 0.8 = 80% — loose enough that only genuine degradation trips (the
+/// loop normally runs at single-digit % utilization), leaving headroom for the
+/// priority-2 supervisor preemption + the UART ISR + jitter. Tighten for more
+/// sensitivity.
+pub const DEADLINE_BUDGET_FRAC: f32 = 0.8;
+
+/// The per-iteration cycle budget, derived. Execution above this = one overrun.
+pub const DEADLINE_BUDGET_CYCLES: u32 =
+    (CONTROL_PERIOD_CYCLES as f32 * DEADLINE_BUDGET_FRAC) as u32;
+
+/// How many CONSECUTIVE overruns in a deadline-bearing state before tripping.
+/// 3 = ~30 ms of sustained overrun — a real degradation, not a one-off blip
+/// (cold-cache first-hit, a single scheduling hiccup). Prevents nuisance trips.
+pub const DEADLINE_MISS_STREAK: u32 = 3;
+
+/// Whether a state is time-critical enough to enforce an execution-time
+/// deadline. Active-control states have hard timing requirements; BOOT / IDLE /
+/// CONFIGURED / FAULT / ESTOP do not (a slow IDLE tick endangers nothing).
+fn state_has_deadline(s: STATE) -> bool {
+    matches!(
+        s,
+        STATE::SPOOLUP
+            | STATE::EXCITE
+            | STATE::PLL_LOCK
+            | STATE::READY
+            | STATE::GENERATE
+            | STATE::LOAD_REJECTION
+            | STATE::RAMP_DOWN
+            | STATE::CALIBRATE
+            | STATE::MANUAL
+    )
+}
 
 /// Clamp a server-commanded overspeed limit into the safe envelope.
 #[inline]
@@ -1102,9 +1144,44 @@ mod app {
                 _ => {}
             }
 
+            // ── record timing + evaluate the execution-time deadline ──
             let elapsed = _wcet_timer.stop();
             let idx = state_index(current_state);
-            cx.shared.wcet.lock(|w| w.record(idx, elapsed));
+            let has_deadline = state_has_deadline(current_state);
+            let deadline_missed = cx.shared.wcet.lock(|w| {
+                w.record_and_check(
+                    idx,
+                    elapsed,
+                    has_deadline,
+                    crate::DEADLINE_BUDGET_CYCLES,
+                    crate::DEADLINE_MISS_STREAK,
+                )
+            });
+
+            if deadline_missed {
+                // The real-time guarantee degraded — fail safe through the
+                // existing fault path (same as any other trip).
+                defmt::error!(
+                    "!! DEADLINE MISS in {} — {} cyc > {} budget, {}x consecutive → FAULT",
+                    // state name via your existing helper if you have one, else idx
+                    idx,
+                    elapsed,
+                    crate::DEADLINE_BUDGET_CYCLES,
+                    crate::DEADLINE_MISS_STREAK
+                );
+                cx.shared.motor.lock(|m| m.emergency_off());
+                cx.shared.relay.lock(|r| r.set_low());
+                cx.shared
+                    .last_fault
+                    .lock(|f| *f = Some(Fault::DeadlineMiss));
+                cx.shared.state.lock(|s| *s = STATE::FAULT);
+                cx.local.pid.reset();
+                *cx.local.ramp = None;
+                *cx.local.run_elapsed_ms = 0;
+                cx.shared.ld3.lock(|l| l.set_high()); // red
+                Mono::delay(dt_ms.millis()).await;
+                continue;
+            }
 
             Mono::delay(dt_ms.millis()).await;
         }

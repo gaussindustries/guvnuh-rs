@@ -52,12 +52,16 @@ impl StateTiming {
 /// The timing table: one StateTiming per state, indexed by state-as-usize.
 pub struct WcetTable {
     states: [StateTiming; N_STATES],
+    /// Consecutive-overrun counter per state. Reset to 0 on any in-budget tick;
+    /// incremented on an overrun. Trips when it reaches the streak threshold.
+    overrun_streak: [u32; N_STATES],
 }
 
 impl WcetTable {
     pub const fn new() -> Self {
         Self {
             states: [StateTiming::new(); N_STATES],
+            overrun_streak: [0; N_STATES],
         }
     }
 
@@ -86,6 +90,40 @@ impl WcetTable {
     }
     pub fn global_max_us(&self) -> f32 {
         self.global_max_cycles() as f32 / (SYSCLK_HZ as f32 / 1_000_000.0)
+    }
+
+    #[inline]
+    pub fn record_and_check(
+        &mut self,
+        state_idx: usize,
+        cycles: u32,
+        has_deadline: bool,
+        budget_cycles: u32,
+        streak_limit: u32,
+    ) -> bool {
+        // always record the timing (even non-deadline states — good for the report)
+        self.record(state_idx, cycles);
+
+        if state_idx >= N_STATES || !has_deadline {
+            return false;
+        }
+
+        if cycles > budget_cycles {
+            // overrun — extend the streak
+            self.overrun_streak[state_idx] = self.overrun_streak[state_idx].saturating_add(1);
+            // trip exactly when we REACH the limit (so it fires once, not every
+            // subsequent tick — the fault transition will leave this state anyway)
+            self.overrun_streak[state_idx] >= streak_limit
+        } else {
+            // in budget — reset the streak
+            self.overrun_streak[state_idx] = 0;
+            false
+        }
+    }
+
+    /// Current overrun streak for a state (diagnostic).
+    pub fn overrun_streak(&self, state_idx: usize) -> u32 {
+        self.overrun_streak.get(state_idx).copied().unwrap_or(0)
     }
 }
 

@@ -112,6 +112,7 @@ pub enum Fault {
     SensorOutOfRange,
     CommLost,
     Overspeed,
+    DeadlineMiss,
 }
 
 impl STATE {
