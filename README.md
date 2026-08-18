@@ -58,6 +58,7 @@ hard real-time safety (STM32/RTIC) with secure cloud telemetry
 | **F-18** | Setpoint-Profile Trajectories | Sparse `(t, target)` breakpoints executed on-device; commanded-vs-actual overlay | ✅ Complete |
 | **F-19** | Profile Library | Named profiles persisted to SurrealDB, upsert-by-name, load into editor | ✅ Complete |
 | **F-20** | Prime-Mover Abstraction | `PrimeMover` trait decouples control from actuator (DC motor ↔ turbine) | ✅ Complete |
+| **F-21** | Deadline Monitoring | Per-state execution-time budget; trips `DeadlineMiss` fault on sustained overrun | ✅ Complete |
 
 ### Phase 2 — EtherCAT Integration
 
@@ -436,6 +437,53 @@ to a spinning mass. This is the seam the Phase 4 turbine fork is built around.
 
 ---
 
+## Timing & Determinism
+
+The control architecture is instrumented for hard-real-time timing analysis and
+enforces its own execution-time deadlines.
+
+### Cycle-accurate measurement
+
+The 100 Hz control loop is instrumented with the Cortex-M7 cycle counter
+(`DWT->CYCCNT`, enabled at boot) to measure **per-state execution time**. Each
+iteration's elapsed cycles are recorded into a per-state table (max + mean),
+giving the observed worst-case execution time of every state at 64 MHz sysclk.
+
+> **Scope, stated precisely:** these are **measurement-based** figures — the
+> *maximum observed* execution time over many iterations — not a statically
+> proven WCET bound (which would require a pipeline-aware analyzer modelling the
+> M7's ART accelerator, branch prediction, and flash wait-states — a planned
+> step toward the SIL-2 target). The distinction is deliberate: the numbers are
+> honest observations, not guarantees.
+
+### Deadline monitoring & fail-safe (`DeadlineMiss`)
+
+Beyond measuring, the firmware **enforces** timing. Each control iteration's
+execution time is checked against a **per-state deadline budget** — a
+configurable fraction of the loop period (`DEADLINE_BUDGET_FRAC`, default 80 %),
+leaving headroom for the priority-2 safety supervisor's preemption, the UART RX
+ISR, and jitter. Only time-critical states carry a deadline (SPOOLUP → GENERATE,
+CALIBRATE, MANUAL); BOOT / IDLE / CONFIGURED / FAULT / ESTOP are exempt.
+
+If a deadline-bearing state overruns its budget for `DEADLINE_MISS_STREAK`
+(default 3) **consecutive** iterations — a *sustained* degradation, not a
+single-sample blip — the firmware trips a `Fault::DeadlineMiss` through the same
+fault path as any other trip: motor de-energized, relay open, → `FAULT`. The
+consecutive-streak filter is deliberate: a safety check that nuisance-trips on
+one anomalous sample gets disabled in practice, which is worse than not having
+it.
+
+This is the RTOS deadline-monitoring concept realized on bare-metal RTIC — the
+system watches its own real-time behaviour and fails safe when guarantees
+degrade. It will not trip under current operation (the loop runs well within
+budget), but the detector is **in place ahead of the failure mode**: once the
+high-temperature / high-pressure operating regime introduces real timing stress
+(sensor-read stalls, heavier control math under load), the response already
+exists. Both the budget fraction and the overrun streak are compile-time
+constants, tunable per deployment.
+
+---
+
 ## REST API Reference
 
 All endpoints served on `:3001`.
@@ -605,6 +653,7 @@ pub enum LiveParam {
 | --- | --- | --- |
 | **Safety Core** | Rust RTIC on STM32H753 | Zero-cost abstractions, data-race freedom |
 | **Safety Supervisor** | Priority-2 RTIC task @ 500 Hz | Preemptive overspeed/sensor trip, comms-independent |
+| **Determinism** | DWT cycle counter + per-state deadline budgets | Measured execution time; fail-safe trip on sustained overrun |
 | **Command RX** | UART4 interrupt + heapless queue | Overrun-free reception, decoupled from control tick |
 | **Link Layer** | Framed `Hello`/`HelloAck` over COBS | Re-entrant handshake; either device reboots, any order |
 | **Calibration** | On-device least-squares + validation | Autonomous fit; raw points reported for richer server analysis |
@@ -641,6 +690,7 @@ pub enum LiveParam {
 │   │           ├── pid.rs        ↳ PID controller (anti-windup, hot-swap gains)
 │   │           ├── ramp.rs       ↳ Linear ramp generator
 │   │           ├── profile.rs    ↳ SetpointProfile + eval_profile (trajectory exec)
+│   │           ├── wcet.rs       ↳ Per-state cycle-count timing + deadline budgets
 │   │           ├── calibrate.rs  ↳ Calibrator: duty→RPM fit, validation, feedforward
 │   │           └── states/       ↳ boot, calibrate, idle, estop, fault...
 │   └── esp32/                 ↳ Telemetry Gateway (esp-hal, no_std)
@@ -673,6 +723,10 @@ pub enum LiveParam {
 - ✅ STM32H753 boots, asserts safe PWM state, enables relay
 - ✅ Independent safety supervisor — preemptive overspeed + sensor-plausibility
      trip at 500 Hz, active from boot, comms-independent
+- ✅ Cycle-accurate per-state execution timing (DWT->CYCCNT) — observed
+     worst-case measured at 64 MHz
+- ✅ Deadline monitoring — per-state execution-time budget (fraction-of-period)
+     trips `Fault::DeadlineMiss` on sustained overrun, through the fault path
 - ✅ Re-entrant `Hello`/`HelloAck` handshake — either device reboots in any order
      and the link re-syncs (reflash-friendly)
 - ✅ AMT102-V rotary encoder reading RPM via QEI (TIM2)
