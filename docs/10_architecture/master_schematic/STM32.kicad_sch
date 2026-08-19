@@ -5,4 +5,50 @@
 	(uuid "7ffc187d-b34a-4041-86a9-ae9e12c85fd8")
 	(paper "A4")
 	(lib_symbols)
+	(sheet
+		(at 116.84 91.44)
+		(size 15.24 6.35)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "925b87b2-c31d-4983-a638-cef36c01a8a7")
+		(property "Sheetname" "States"
+			(at 116.84 90.7284 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "states.kicad_sch"
+			(at 116.84 98.3746 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "master_schematic"
+				(path "/161501ba-58a2-4e54-b00f-2c454c29b444/7e33f781-3aae-4aa0-9862-70bc5b76b4e4"
+					(page "5")
+				)
+			)
+		)
+	)
 )

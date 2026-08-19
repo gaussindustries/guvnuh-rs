@@ -4156,7 +4156,7 @@
 	)
 	(wire
 		(pts
-			(xy 87.63 86.36) (xy 87.63 119.38)
+			(xy 87.63 86.36) (xy 87.63 110.49)
 		)
 		(stroke
 			(width 0)
@@ -4246,6 +4246,16 @@
 	)
 	(wire
 		(pts
+			(xy 96.52 74.93) (xy 121.92 74.93)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1a78bb9b-8a66-401a-aa50-3eb02d907fc1")
+	)
+	(wire
+		(pts
 			(xy 73.66 81.28) (xy 77.47 81.28)
 		)
 		(stroke
@@ -4266,6 +4276,16 @@
 	)
 	(wire
 		(pts
+			(xy 96.52 90.17) (xy 96.52 74.93)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "253335e8-813b-477c-92bb-cba763c18692")
+	)
+	(wire
+		(pts
 			(xy 74.93 30.48) (xy 217.17 30.48)
 		)
 		(stroke
@@ -4273,16 +4293,6 @@
 			(type default)
 		)
 		(uuid "2770b060-bc44-42f9-8939-2b54f55d7662")
-	)
-	(wire
-		(pts
-			(xy 87.63 119.38) (xy 35.56 119.38)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "2946a81a-5c2d-4557-85c8-d2d37ebd4897")
 	)
 	(wire
 		(pts
@@ -4456,7 +4466,7 @@
 	)
 	(wire
 		(pts
-			(xy 34.29 62.23) (xy 34.29 87.63)
+			(xy 34.29 62.23) (xy 34.29 76.2)
 		)
 		(stroke
 			(width 0)
@@ -4646,6 +4656,16 @@
 	)
 	(wire
 		(pts
+			(xy 35.56 96.52) (xy 35.56 110.49)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6c4598cc-860c-46dd-93e3-f35c30f7ed52")
+	)
+	(wire
+		(pts
 			(xy 167.64 86.36) (xy 172.72 86.36)
 		)
 		(stroke
@@ -4696,7 +4716,7 @@
 	)
 	(wire
 		(pts
-			(xy 38.1 59.69) (xy 38.1 87.63)
+			(xy 38.1 59.69) (xy 38.1 76.2)
 		)
 		(stroke
 			(width 0)
@@ -4763,6 +4783,16 @@
 			(type default)
 		)
 		(uuid "7b240888-4c26-4913-912a-02df82e5d538")
+	)
+	(wire
+		(pts
+			(xy 105.41 90.17) (xy 96.52 90.17)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "7c1ce087-0e46-48f6-b984-24e6dc15c7ce")
 	)
 	(wire
 		(pts
@@ -4843,16 +4873,6 @@
 			(type default)
 		)
 		(uuid "90af5dd2-ba08-4b43-aec8-abde1083b876")
-	)
-	(wire
-		(pts
-			(xy 40.64 114.3) (xy 50.8 114.3)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "935543c5-ce8d-40c6-9a1d-261b8ee76e92")
 	)
 	(wire
 		(pts
@@ -4966,16 +4986,6 @@
 	)
 	(wire
 		(pts
-			(xy 50.8 114.3) (xy 50.8 102.87)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "a1b10f59-73a7-4dbc-8118-e82b8be86510")
-	)
-	(wire
-		(pts
 			(xy 41.91 57.15) (xy 55.88 57.15)
 		)
 		(stroke
@@ -5013,6 +5023,16 @@
 			(type default)
 		)
 		(uuid "a7b21f53-6eef-444b-a6a1-31483266db70")
+	)
+	(wire
+		(pts
+			(xy 121.92 74.93) (xy 121.92 68.58)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ab430c9e-f144-4c75-afa5-6cdb4211a5b7")
 	)
 	(wire
 		(pts
@@ -5143,6 +5163,16 @@
 			(type default)
 		)
 		(uuid "c2ea175b-32db-470e-805c-237be1d915a3")
+	)
+	(wire
+		(pts
+			(xy 40.64 96.52) (xy 40.64 102.87)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "c4ddda31-baca-44c2-b5f5-cc76411b8b58")
 	)
 	(wire
 		(pts
@@ -5296,7 +5326,7 @@
 	)
 	(wire
 		(pts
-			(xy 50.8 102.87) (xy 62.23 102.87)
+			(xy 40.64 102.87) (xy 62.23 102.87)
 		)
 		(stroke
 			(width 0)
@@ -5373,16 +5403,6 @@
 			(type default)
 		)
 		(uuid "dea8485c-8ff5-4325-a4b1-5ace57bfb30e")
-	)
-	(wire
-		(pts
-			(xy 35.56 119.38) (xy 35.56 107.95)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "dfebd0dd-52bb-419c-92fa-6de93ac43e84")
 	)
 	(wire
 		(pts
@@ -5516,13 +5536,13 @@
 	)
 	(wire
 		(pts
-			(xy 40.64 107.95) (xy 40.64 114.3)
+			(xy 35.56 110.49) (xy 87.63 110.49)
 		)
 		(stroke
 			(width 0)
 			(type default)
 		)
-		(uuid "fc76cfcf-56f9-448b-8644-d0eb2dc358db")
+		(uuid "fdc44229-e476-4c1d-8bb8-6743cd5d9ef0")
 	)
 	(wire
 		(pts
@@ -5536,7 +5556,7 @@
 	)
 	(wire
 		(pts
-			(xy 41.91 57.15) (xy 41.91 87.63)
+			(xy 41.91 57.15) (xy 41.91 76.2)
 		)
 		(stroke
 			(width 0)
@@ -7505,7 +7525,7 @@
 	)
 	(symbol
 		(lib_id "Power_Management:Chinese_PSU_72V_600W")
-		(at 38.1 97.79 270)
+		(at 38.1 86.36 270)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -7515,7 +7535,7 @@
 		(dnp no)
 		(uuid "f2b4b231-be5f-455e-85be-ff69c62ac933")
 		(property "Reference" "PSU 72V | 8A | 600W"
-			(at 26.162 97.282 90)
+			(at 26.162 85.852 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -7526,7 +7546,7 @@
 			)
 		)
 		(property "Value" ""
-			(at 38.1 97.79 0)
+			(at 38.1 86.36 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -7536,7 +7556,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 38.1 97.79 0)
+			(at 38.1 86.36 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -7547,7 +7567,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 38.1 97.79 0)
+			(at 38.1 86.36 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -7558,7 +7578,7 @@
 			)
 		)
 		(property "Description" ""
-			(at 38.1 97.79 0)
+			(at 38.1 86.36 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -7762,7 +7782,7 @@
 		)
 	)
 	(sheet
-		(at 160.02 45.72)
+		(at 130.81 39.37)
 		(size 15.24 6.35)
 		(exclude_from_sim no)
 		(in_bom yes)
@@ -7778,7 +7798,7 @@
 		)
 		(uuid "382fc563-bd2c-4f55-afa5-84da2a777f62")
 		(property "Sheetname" "States"
-			(at 160.02 45.0084 0)
+			(at 130.81 38.6584 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -7789,7 +7809,7 @@
 			)
 		)
 		(property "Sheetfile" "states.kicad_sch"
-			(at 160.02 52.6546 0)
+			(at 130.81 46.3046 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
