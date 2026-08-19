@@ -661,7 +661,7 @@
         "uuid": "161501ba-58a2-4e54-b00f-2c454c29b444"
       }
     ],
-    "used_designators": "U10,C1-3",
+    "used_designators": "#PWR4-6,P1,K1-3,R1-2,U7-10,D1-3,C1-3",
     "variants": []
   },
   "sheets": [
@@ -672,6 +672,14 @@
     [
       "382fc563-bd2c-4f55-afa5-84da2a777f62",
       "States"
+    ],
+    [
+      "c8bf5a6b-94be-4d6c-acc8-d6d8337099a8",
+      "IV ADC Circuit"
+    ],
+    [
+      "7e33f781-3aae-4aa0-9862-70bc5b76b4e4",
+      "STM/ESP 32 IO"
     ]
   ],
   "text_variables": {},
