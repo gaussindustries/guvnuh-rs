@@ -116,7 +116,7 @@ sequencing states advance on measured conditions, not just spin.
 
 ---
 
-## System Architecture
+## [System Architecture] (https://kicanvas.org/?repo=https%3A%2F%2Fgithub.com%2Fgaussindustries%2Fguvnuh-rs%2Ftree%2Fmain%2Fdocs%2F10_architecture%2Fmaster_schematic "Click me to view Schematics Online!")
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
