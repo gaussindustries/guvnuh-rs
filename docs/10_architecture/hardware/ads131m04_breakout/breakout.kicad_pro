@@ -449,7 +449,6 @@
       "footprint_filter": "ignore",
       "footprint_link_issues": "warning",
       "four_way_junction": "ignore",
-      "global_label_dangling": "warning",
       "ground_pin_not_ground": "warning",
       "hier_label_mismatch": "error",
       "isolated_pin_label": "warning",
@@ -489,7 +488,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "master_schematic.kicad_pro",
+    "filename": "breakout.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -523,14 +522,11 @@
   },
   "pcbnew": {
     "last_paths": {
-      "gencad": "",
       "idf": "",
       "netlist": "",
       "plot": "",
-      "pos_files": "",
       "specctra_dsn": "",
       "step": "",
-      "svg": "",
       "vrml": ""
     },
     "page_layout_descr_file": ""
@@ -594,6 +590,18 @@
         },
         {
           "group_by": true,
+          "label": "Exclude from Simulation",
+          "name": "${EXCLUDE_FROM_SIM}",
+          "show": true
+        },
+        {
+          "group_by": true,
+          "label": "Exclude from Position Files",
+          "name": "${EXCLUDE_FROM_POS_FILES}",
+          "show": true
+        },
+        {
+          "group_by": true,
           "label": "Footprint",
           "name": "Footprint",
           "show": true
@@ -641,49 +649,25 @@
     "meta": {
       "version": 1
     },
-    "net_format_name": "",
     "page_layout_descr_file": "",
     "plot_directory": "",
     "reuse_designators": true,
-    "space_save_all_events": true,
-    "spice_current_sheet_as_root": false,
-    "spice_external_command": "spice \"%I\"",
-    "spice_model_current_sheet_as_root": true,
-    "spice_save_all_currents": false,
-    "spice_save_all_dissipations": false,
-    "spice_save_all_voltages": false,
     "subpart_first_id": 65,
     "subpart_id_separator": 0,
     "top_level_sheets": [
       {
-        "filename": "master_schematic.kicad_sch",
-        "name": "master_schematic",
-        "uuid": "161501ba-58a2-4e54-b00f-2c454c29b444"
+        "filename": "breakout.kicad_sch",
+        "name": "Root",
+        "uuid": "5bed3444-7eef-4d66-a096-28586a9fad8a"
       }
     ],
-    "used_designators": "XTAL1,J1-3,PSU 72V | 8A | 600W1,Y1,#PWR4-7,P1,K1-3,R1-3,U7-10,D1-3,C1-7",
+    "used_designators": "Y1,U1,R1,J1-2,C1-4",
     "variants": []
   },
   "sheets": [
     [
-      "161501ba-58a2-4e54-b00f-2c454c29b444",
-      "master_schematic"
-    ],
-    [
-      "382fc563-bd2c-4f55-afa5-84da2a777f62",
-      "States"
-    ],
-    [
-      "c8bf5a6b-94be-4d6c-acc8-d6d8337099a8",
-      "IV ADC Circuit"
-    ],
-    [
-      "7e33f781-3aae-4aa0-9862-70bc5b76b4e4",
-      "STM/ESP 32 IO"
-    ],
-    [
-      "925b87b2-c31d-4983-a638-cef36c01a8a7",
-      "States"
+      "5bed3444-7eef-4d66-a096-28586a9fad8a",
+      "Root"
     ]
   ],
   "text_variables": {},

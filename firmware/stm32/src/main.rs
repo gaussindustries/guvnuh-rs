@@ -228,7 +228,7 @@ mod app {
                 ld1: board.ld1,
                 ld2: board.ld2,
                 ld3: board.ld3,
-                relay: board.relay,
+                relay: board.motor_relay,
                 motor,
                 encoder: board.encoder,
                 tx: board.tx,

@@ -7534,7 +7534,7 @@
 		(in_pos_files yes)
 		(dnp no)
 		(uuid "f2b4b231-be5f-455e-85be-ff69c62ac933")
-		(property "Reference" "PSU 72V | 8A | 600W"
+		(property "Reference" "PSU 72V | 8A | 600W1"
 			(at 26.162 85.852 90)
 			(show_name no)
 			(do_not_autoplace no)
@@ -7606,7 +7606,7 @@
 		(instances
 			(project "master_schematic"
 				(path "/161501ba-58a2-4e54-b00f-2c454c29b444"
-					(reference "PSU 72V | 8A | 600W")
+					(reference "PSU 72V | 8A | 600W1")
 					(unit 1)
 				)
 			)

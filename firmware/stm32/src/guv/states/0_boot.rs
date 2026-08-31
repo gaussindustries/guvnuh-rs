@@ -19,19 +19,22 @@ pub struct Board {
     pub ld3: gpio::Pin<'B', 14, Output<PushPull>>,
 
     //this enables motor power, will be used in E-Stop
-    pub relay: gpio::Pin<'E', 0, Output<PushPull>>,
+    pub motor_relay: gpio::Pin<'E', 0, Output<PushPull>>,
 
     pub motor_pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
 
+    // these enable load the resistors,
+    // either can be enabled but each are 2.2k Ω
+    pub r1_relay: gpio::Pin<'E', 3, Output<PushPull>>,
+    pub r2_relay: gpio::Pin<'E', 4, Output<PushPull>>,
+
     //UART
+    pub rx: serial::Rx<pac::UART4>,
     pub tx: serial::Tx<pac::UART4>,
 
     //INPUTS
     //batch for AMT102-V | rotary encoder (sys rpm)
     pub encoder: Qei<TIM2>,
-
-    //UART
-    pub rx: serial::Rx<pac::UART4>,
 }
 
 pub fn setup(dp: pac::Peripherals) -> Board {
@@ -60,17 +63,17 @@ pub fn setup(dp: pac::Peripherals) -> Board {
     let pwm_pin = gpioe.pe9.into_alternate::<1>();
 
     // Consumes TIM1 token from ccdr
-    let mut motor_pwm = dp.TIM1.pwm(
-        pwm_pin,
-        20.kHz(),
-        ccdr.peripheral.TIM1, // <--- Token MOVED here
-        &ccdr.clocks,
-    );
+    let mut motor_pwm = dp
+        .TIM1
+        .pwm(pwm_pin, 20.kHz(), ccdr.peripheral.TIM1, &ccdr.clocks);
 
     motor_pwm.enable();
     motor_pwm.set_duty(motor_pwm.get_max_duty());
 
-    let mut relay = gpioe.pe0.into_push_pull_output();
+    //relays
+    let mut motor_relay = gpioe.pe0.into_push_pull_output();
+    let mut r1_relay = gpioe.pe3.into_push_pull_output();
+    let mut r2_relay = gpioe.pe4.into_push_pull_output();
 
     //a & b channel pair for rotary encoder
     let enc_pin_a = gpioa.pa0.into_alternate::<1>();
@@ -103,13 +106,18 @@ pub fn setup(dp: pac::Peripherals) -> Board {
     ld3.set_low();
 
     //we need to send our pwm signal into the pwm controller first before we enable power to the dc motor
-    relay.set_low();
+    motor_relay.set_low();
+    //no load should be applied at startup
+    r1_relay.set_low();
+    r2_relay.set_low();
 
     Board {
         ld1,
         ld2,
         ld3,
-        relay,
+        motor_relay,
+        r1_relay,
+        r2_relay,
         motor_pwm,
         encoder,
         tx,
