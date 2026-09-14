@@ -13,7 +13,7 @@ use rtic_monotonics::fugit::ExtU32;
 use rtic_monotonics::systick::prelude::*;
 use stm32h7xx_hal::{
     device::{TIM1, TIM2},
-    gpio::{self, GpioExt, Output, PushPull},
+    gpio::{self, ExtiPin, GpioExt, Output, PushPull},
     prelude::*,
     pwm,
     qei::Qei,
@@ -46,6 +46,9 @@ fn cmd_name(c: &Command) -> &'static str {
         Command::ClearFaults => "ClearFaults",
         Command::Hello => "Hello",
         Command::HelloAck => "HelloAck",
+        Command::SetLoad(_) => "SetLoad",
+        Command::StepLoadUp => "StepLoadUp",
+        Command::StepLoadDown => "StepLoadDown",
         Command::LoadProfile(_) => "LoadProfile",
     }
 }
@@ -77,6 +80,11 @@ fn enable_cycle_counter(dcb: &mut DCB, dwt: &mut DWT) {
 }
 
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
+
+pub const LOAD_REJECT_DROP_W: f32 = 200.0; // W drop between 500Hz ticks = rejection
+pub const LOAD_REJECT_MIN_W: f32 = 100.0; // only arm the detector above this load
+pub const DC_OVERVOLT_LIMIT: f32 = 300.0; // V — DC bus ceiling (tune to your rectifier)
+pub const DC_OVERCURRENT_LIMIT: f32 = 20.0; // A — DC bus current ceiling
 /// Active from boot with zero config — the autonomous-mode ceiling.
 pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2800.0;
 /// Absolute bounds any server-commanded limit is clamped to. The server can
@@ -162,6 +170,13 @@ mod app {
         tx: stm32h7xx_hal::serial::Tx<stm32h7xx_hal::pac::UART4>,
         rx: stm32h7xx_hal::serial::Rx<stm32h7xx_hal::pac::UART4>,
 
+        //load
+        load_bank: crate::guv::load_bank::LoadBank,
+
+        adc: crate::guv::adc::Ads131Pair,
+        adc_acc: crate::guv::adc::Accumulator,
+        adc_meas: crate::guv::adc::Measurements,
+
         // State
         pub state: STATE,
         pub run_config: Option<RunConfig>,
@@ -170,6 +185,7 @@ mod app {
         pub cmd_in: heapless::Deque<Command, 8>,
 
         pub measurements: crate::models::measurements::Measurements,
+
         pub calibration: Option<crate::guv::calibrate::CalResult>,
         pub pending_report: Option<shared::models::telemetry::telemetry::CalibrationReport>,
 
@@ -196,6 +212,8 @@ mod app {
         run_elapsed_ms: u32,
         calibrator: Option<crate::guv::calibrate::Calibrator>,
         boot_hello_attempts: u32,
+        adc_drdy: crate::guv::adc::Drdy,
+        last_p_total: f32,
     }
 
     #[init]
@@ -213,7 +231,16 @@ mod app {
 
         let sys_freq = board.clocks.sysclk().to_Hz();
         Mono::start(cx.core.SYST, sys_freq);
-
+        defmt::info!("INIT: setup() returned");
+        let adc = crate::guv::adc::Ads131Pair::new(
+            board.adc_spi,
+            board.adc_cs1,
+            board.adc_cs2,
+            board.adc_sync,
+            board.adc_rst,
+        );
+        defmt::info!("INIT: Ads131Pair::new() complete");
+        let load_bank = crate::guv::load_bank::LoadBank::new(board.load_step_1, board.load_step_2);
         state_manager::spawn().ok();
         telemetry_task::spawn().ok();
         safety_supervisor::spawn().ok();
@@ -221,7 +248,6 @@ mod app {
         cx.core.DCB.enable_trace();
         cx.core.DWT.enable_cycle_counter();
         board.ld3.set_high(); // Red = booting
-
         (
             Shared {
                 state: STATE::BOOT,
@@ -243,6 +269,10 @@ mod app {
                 overspeed_limit: crate::OVERSPEED_LIMIT_DEFAULT,
                 active_profile: Some(DEFAULT_PROFILE),
                 wcet: WcetTable::new(),
+                load_bank,
+                adc,
+                adc_acc: crate::guv::adc::Accumulator::default(),
+                adc_meas: crate::guv::adc::Measurements::default(),
             },
             Local {
                 safety_init_done: false,
@@ -253,6 +283,8 @@ mod app {
                 run_elapsed_ms: 0,
                 calibrator: None,
                 boot_hello_attempts: 0,
+                last_p_total: 0.0,
+                adc_drdy: board.adc_drdy,
             },
         )
     }
@@ -263,7 +295,10 @@ mod app {
     //  local sensors; no dependency on ESP32 or server. This layer keeps the
     //  machine safe even when everything upstream is dead.
     // ────────────────────────────────────────────
-    #[task(priority = 2, shared = [current_rpm, overspeed_limit, motor, relay, state, last_fault, ld3])]
+    #[task(priority = 2,
+        shared = [current_rpm, overspeed_limit, motor, relay,
+            state, last_fault, ld3, adc_acc, load_bank] ,
+        local = [last_p_total])]
     async fn safety_supervisor(mut cx: safety_supervisor::Context) {
         const SUPERVISE_MS: u32 = 2; // 500 Hz
 
@@ -311,13 +346,76 @@ mod app {
                 // Keep forcing off every cycle while faulted — the supervisor
                 // doesn't rely on state_manager running to hold safe.
             }
+            // ── ADC-based fast protection (runs every 500Hz tick) ──
+            let prot = cx
+                .shared
+                .adc_acc
+                .lock(|acc| crate::guv::adc::finalize_protection(acc, 1.0));
+
+            // LOAD REJECTION: a sudden real-power drop → generator unloads →
+            // overspeed hazard (critical for a turbine). React LOCALLY, now.
+            let last_p = *cx.local.last_p_total;
+            let p_drop = last_p - prot.p_total;
+            if last_p > crate::LOAD_REJECT_MIN_W && p_drop > crate::LOAD_REJECT_DROP_W {
+                let already_faulted = cx
+                    .shared
+                    .state
+                    .lock(|s| matches!(*s, STATE::FAULT | STATE::ESTOP));
+                if !already_faulted {
+                    defmt::warn!(
+                        "!! LOAD REJECTION !! p {}W -> {}W (drop {}W)",
+                        last_p as i32,
+                        prot.p_total as i32,
+                        p_drop as i32
+                    );
+                    // shed the bank immediately + go to fault.
+                    cx.shared.load_bank.lock(|lb| lb.emergency_shed());
+                    cx.shared.motor.lock(|m| m.emergency_off());
+                    cx.shared.relay.lock(|r| r.set_low());
+                    cx.shared
+                        .last_fault
+                        .lock(|f| *f = Some(Fault::LoadRejection));
+                    cx.shared.state.lock(|s| *s = STATE::FAULT);
+                    cx.shared.ld3.lock(|l| l.set_high());
+                }
+            }
+            *cx.local.last_p_total = prot.p_total;
+
+            // fast DC-bus electrical trips (local, no comms):
+            if prot.v_dc > crate::DC_OVERVOLT_LIMIT || prot.i_dc > crate::DC_OVERCURRENT_LIMIT {
+                let already_faulted = cx
+                    .shared
+                    .state
+                    .lock(|s| matches!(*s, STATE::FAULT | STATE::ESTOP));
+                if !already_faulted {
+                    defmt::error!(
+                        "!! DC BUS TRIP !! v={} i={}",
+                        prot.v_dc as i32,
+                        prot.i_dc as i32
+                    );
+                    cx.shared.load_bank.lock(|lb| lb.emergency_shed());
+                    cx.shared.motor.lock(|m| m.emergency_off());
+                    cx.shared.relay.lock(|r| r.set_low());
+                    cx.shared.last_fault.lock(|f| {
+                        *f = Some(if prot.v_dc > crate::DC_OVERVOLT_LIMIT {
+                            Fault::OverVoltage
+                        } else {
+                            Fault::OverCurrent
+                        })
+                    });
+                    cx.shared.state.lock(|s| *s = STATE::FAULT);
+                    cx.shared.ld3.lock(|l| l.set_high());
+                }
+            }
         }
     }
     // ────────────────────────────────────────────
     //  State Manager — the main control loop
     // ────────────────────────────────────────────
     #[task(priority = 1,
-        shared = [state, ld1, ld2, ld3, relay, motor, tx, rx, run_config, current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile, wcet],
+        shared = [state, ld1, ld2, ld3, relay, load_bank, motor, tx, rx, run_config,
+            current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile,
+            wcet, adc_acc,adc_meas],
         local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
@@ -329,42 +427,73 @@ mod app {
             // ── Pull one decoded command from the ISR-fed queue ──
             let received_cmd: Option<Command> = cx.shared.cmd_in.lock(|q| q.pop_front());
 
-            // ── ESTOP — always honored, any state ──
-            if let Some(Command::EmergencyStop) = received_cmd {
-                defmt::warn!("!! EMERGENCY STOP !!");
-                cx.shared.motor.lock(|m| m.emergency_off());
-                cx.shared.relay.lock(|r| r.set_low());
-                cx.shared.state.lock(|s| *s = STATE::ESTOP);
-                cx.local.pid.reset();
-                *cx.local.ramp = None;
-                *cx.local.run_elapsed_ms = 0;
-                cx.shared.ld1.lock(|l| l.set_low());
-                cx.shared.ld2.lock(|l| l.set_low());
-                cx.shared.ld3.lock(|l| l.set_high()); // red solid
-                Mono::delay(dt_ms.millis()).await;
-                continue;
-            }
-
-            // ── ESP32 (re)start announcement — reply from ANY state ──
-            // The ESP32 rebooted and is re-announcing. Ack it so the link
-            // re-syncs, but DO NOT change state — the machine keeps doing
-            // exactly what it was doing. Comms absence never stopped us;
-            // comms return never disrupts us.
-            if let Some(Command::Hello) = received_cmd {
-                defmt::info!("ESP32 Hello — re-syncing link (state unchanged)");
-                cx.shared.tx.lock(|tx| {
-                    let mut buf = [0u8; 16];
-                    if let Ok(enc) = postcard::to_slice_cobs(&Uplink::HelloAck, &mut buf) {
-                        for b in enc.iter() {
-                            block!(tx.write(*b)).ok();
+            // ── High-priority commands honored in ANY state (ESTOP, Hello, Load) ──
+            // Match by reference so `received_cmd` stays available for the state machine below.
+            match &received_cmd {
+                Some(Command::EmergencyStop) => {
+                    defmt::warn!("!! EMERGENCY STOP !!");
+                    cx.shared.motor.lock(|m| m.emergency_off());
+                    cx.shared.relay.lock(|r| r.set_low());
+                    cx.shared.load_bank.lock(|lb| lb.emergency_shed());
+                    cx.shared.state.lock(|s| *s = STATE::ESTOP);
+                    cx.local.pid.reset();
+                    *cx.local.ramp = None;
+                    *cx.local.run_elapsed_ms = 0;
+                    cx.shared.ld1.lock(|l| l.set_low());
+                    cx.shared.ld2.lock(|l| l.set_low());
+                    cx.shared.ld3.lock(|l| l.set_high()); // red solid
+                    Mono::delay(dt_ms.millis()).await;
+                    continue;
+                }
+                Some(Command::Hello) => {
+                    defmt::info!("ESP32 Hello — re-syncing link (state unchanged)");
+                    cx.shared.tx.lock(|tx| {
+                        let mut buf = [0u8; 16];
+                        if let Ok(enc) = postcard::to_slice_cobs(&Uplink::HelloAck, &mut buf) {
+                            for b in enc.iter() {
+                                block!(tx.write(*b)).ok();
+                            }
                         }
-                    }
-                });
-                Mono::delay(dt_ms.millis()).await;
-                continue;
+                    });
+                    Mono::delay(dt_ms.millis()).await;
+                    continue;
+                }
+                Some(Command::StepLoadUp) => {
+                    cx.shared.load_bank.lock(|lb| lb.step_up());
+                    // no continue — fall through to the rest of the loop
+                }
+                Some(Command::StepLoadDown) => {
+                    cx.shared.load_bank.lock(|lb| lb.step_down());
+                }
+                Some(Command::SetLoad(level)) => {
+                    let target = match level {
+                        shared::models::telemetry::telemetry::LoadLevel::None => {
+                            crate::guv::load_bank::LoadLevel::None
+                        }
+                        shared::models::telemetry::telemetry::LoadLevel::One => {
+                            crate::guv::load_bank::LoadLevel::One
+                        }
+                        shared::models::telemetry::telemetry::LoadLevel::Both => {
+                            crate::guv::load_bank::LoadLevel::Both
+                        }
+                    };
+                    cx.shared.load_bank.lock(|lb| lb.set_level(target));
+                }
+                _ => {
+                    // all other commands (Configure/Start/Stop/LiveAdjust/etc.) are handled
+                    // by the state machine below — do nothing here, let them fall through.
+                }
             }
 
             let _wcet_timer = CycleTimer::start();
+
+            // ── ADC full finalize: compute all scalars, store, reset the window ──
+            let adc_m = cx.shared.adc_acc.lock(|acc| {
+                let m = crate::guv::adc::finalize_full(acc, 1.0);
+                acc.reset(); // this task OWNS the reset (500Hz only reads partials)
+                m
+            });
+            cx.shared.adc_meas.lock(|am| *am = adc_m);
 
             // ── State machine ──
             match current_state {
@@ -1099,6 +1228,7 @@ mod app {
                 STATE::FAULT => {
                     cx.shared.motor.lock(|m| m.emergency_off());
                     cx.shared.relay.lock(|r| r.set_low());
+                    cx.shared.load_bank.lock(|lb| lb.emergency_shed());
 
                     cx.shared.ld3.lock(|l| l.set_high());
                     cx.shared.ld1.lock(|l| l.set_low());
@@ -1190,7 +1320,7 @@ mod app {
     // ────────────────────────────────────────────
     //  RPM Monitor — encoder reading + telemetry
     // ────────────────────────────────────────────
-    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault, measurements, pending_report])]
+    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault, measurements, pending_report, adc_meas, load_bank])]
     async fn telemetry_task(mut cx: telemetry_task::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
@@ -1225,25 +1355,49 @@ mod app {
                         // when the ADC lands, a separate `measurement` task fills meas.v_gen_rms etc.
                         *current_rpm = rpm;
                         meas.rpm = rpm;
-
+                        let adc_m = cx.shared.adc_meas.lock(|am| *am);
+                        let load_lvl = cx.shared.load_bank.lock(|lb| lb.level());
+                        let wire_load = match load_lvl {
+                            crate::guv::load_bank::LoadLevel::None => {
+                                shared::models::telemetry::telemetry::LoadLevel::None
+                            }
+                            crate::guv::load_bank::LoadLevel::One => {
+                                shared::models::telemetry::telemetry::LoadLevel::One
+                            }
+                            crate::guv::load_bank::LoadLevel::Both => {
+                                shared::models::telemetry::telemetry::LoadLevel::Both
+                            }
+                        };
                         // ── assembly: frame is built FROM measurements ──
                         let frame = shared::models::telemetry::telemetry::Telemetry {
                             ts_ms,
                             state: *state,
                             rpm: meas.rpm,
                             duty_percent: motor.demand(),
-                            v_gen_rms: meas.v_gen_rms,
-                            i_gen_rms: meas.i_gen_rms,
-                            freq_gen_hz: meas.freq_gen_hz,
-                            theta_err_rad: 0.0, // still a stub — no sensor
+                            // legacy fields now fed from ADC (phase A / totals):
+                            v_gen_rms: adc_m.v_a_rms,
+                            i_gen_rms: adc_m.i_a_rms,
+                            freq_gen_hz: adc_m.freq_hz,
+                            theta_err_rad: 0.0,
                             temp_c: meas.temp_c,
-                            dc_bus_v: meas.dc_bus_v,
+                            dc_bus_v: adc_m.v_dc,
+                            // NEW 3-phase fields:
+                            v_a_rms: adc_m.v_a_rms,
+                            v_b_rms: adc_m.v_b_rms,
+                            v_c_rms: adc_m.v_c_rms,
+                            i_a_rms: adc_m.i_a_rms,
+                            i_b_rms: adc_m.i_b_rms,
+                            i_c_rms: adc_m.i_c_rms,
+                            p_total_w: adc_m.p_total,
+                            pf: adc_m.pf,
+                            dc_bus_i: adc_m.i_dc,
+                            load_level: wire_load,
                             run_mode: run_config.map(|c| c.mode),
                             fault: *last_fault,
                         };
 
                         if *state != STATE::BOOT {
-                            let mut buf = [0u8; 96];
+                            let mut buf = [0u8; 192];
                             if let Ok(encoded) =
                                 postcard::to_slice_cobs(&Uplink::Telemetry(frame), &mut buf)
                             {
@@ -1254,7 +1408,7 @@ mod app {
 
                             // send a pending calibration report, if one was queued
                             if let Some(rep) = report {
-                                let mut rbuf = [0u8; 96];
+                                let mut rbuf = [0u8; 192];
                                 if let Ok(encoded) =
                                     postcard::to_slice_cobs(&Uplink::Calibration(rep), &mut rbuf)
                                 {
@@ -1318,6 +1472,22 @@ mod app {
                 }
             }
         });
+    }
+    // ─────────────────────────────────────────────────────────────────────────────
+    // C) DRDY ISR — fires at ADC_SAMPLE_RATE (~4kHz). Lean: read frame, accumulate.
+    //    Priority 3 (above 500Hz supervise=2, 100Hz control=1) — a missed sample
+    //    corrupts RMS, but this is tiny. Uses a spare EXTI line binding for PD10.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    #[task(binds = EXTI15_10, priority = 3, shared = [adc, adc_acc], local = [adc_drdy])]
+    fn adc_drdy_isr(mut cx: adc_drdy_isr::Context) {
+        if crate::guv::adc::ADC_HARDWARE_ENABLED {
+            cx.shared.adc.lock(|adc| {
+                let frame = adc.read_frame();
+                cx.shared.adc_acc.lock(|acc| acc.add(&frame));
+            });
+        }
+        cx.local.adc_drdy.clear_interrupt_pending_bit();
     }
     // FUTURE — do not add until ADS131M04 is wired
     // #[task(priority = 1, shared = [encoder, measurements], local = [/* adc handle, sample buffer */])]

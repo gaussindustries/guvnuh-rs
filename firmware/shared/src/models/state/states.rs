@@ -113,6 +113,7 @@ pub enum Fault {
     CommLost,
     Overspeed,
     DeadlineMiss,
+    LoadRejection,
 }
 
 impl STATE {

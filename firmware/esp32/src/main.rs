@@ -184,7 +184,7 @@ async fn tcp_task(
     let mut rx_buf = [0u8; 1024];
     let mut tx_buf = [0u8; 1024];
     let mut uart_buf = [0u8; 1];
-    let mut cobs_buf = [0u8; 128];
+    let mut cobs_buf = [0u8; 192];
     let mut cobs_len = 0usize;
 
     loop {

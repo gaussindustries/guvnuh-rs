@@ -61,6 +61,19 @@ pub struct CalPoint {
     pub samples: u32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LoadLevel {
+    None, // both steps open
+    One,  // step 1 closed
+    Both, // step 1 + 2 closed
+}
+
+impl Default for LoadLevel {
+    fn default() -> Self {
+        LoadLevel::None
+    }
+}
+
 /// Single telemetry sample — canonical wire format.
 /// Serialized via postcard/COBS over UART, deserialized on the server.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -69,12 +82,29 @@ pub struct Telemetry {
     pub state: STATE,
     pub rpm: f32,
     pub duty_percent: f32,
-    pub v_gen_rms: f32,
-    pub i_gen_rms: f32,
-    pub freq_gen_hz: f32,
+
+    // (kept; now = phase A / totals so old UI still works) ──
+    pub v_gen_rms: f32,   // = v_a_rms (phase A) — legacy field
+    pub i_gen_rms: f32,   // = i_a_rms
+    pub freq_gen_hz: f32, // = freq_hz
     pub theta_err_rad: f32,
     pub temp_c: f32,
-    pub dc_bus_v: f32,
+    pub dc_bus_v: f32, // = v_dc
+
+    // full 3-phase from the dual ADS131M04 ──
+    pub v_a_rms: f32,
+    pub v_b_rms: f32,
+    pub v_c_rms: f32,
+    pub i_a_rms: f32,
+    pub i_b_rms: f32,
+    pub i_c_rms: f32,
+    pub p_total_w: f32, // total real power — the load-rejection sentinel
+    pub pf: f32,        // total power factor
+    pub dc_bus_i: f32,  // DC bus current (rectifier output)
+
+    // load bank state (so terminal shows which steps are engaged) ──
+    pub load_level: LoadLevel,
+
     pub run_mode: Option<RunMode>,
     pub fault: Option<Fault>,
 }
@@ -189,6 +219,12 @@ pub enum Command {
     ClearFaults,
     Hello,    // ESP32 announces (re)start — "are you there?"
     HelloAck, // ESP32 acknowledges the STM32's Hello — "yes, I'm here"
+    /// Step the load bank UP one level (None→One→Both). STM32 enforces order.
+    StepLoadUp,
+    /// Step the load bank DOWN one level gracefully (Both→One→None; opens 2 then 1).
+    StepLoadDown,
+    /// Set an explicit load level; STM32 takes the correct ordered path there.
+    SetLoad(LoadLevel),
     LoadProfile(SetpointProfile),
 }
 

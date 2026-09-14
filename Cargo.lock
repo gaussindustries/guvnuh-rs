@@ -1576,6 +1576,7 @@ dependencies = [
  "defmt-rtt",
  "fugit",
  "heapless 0.9.3",
+ "libm",
  "nb 1.1.0",
  "panic-probe",
  "postcard",

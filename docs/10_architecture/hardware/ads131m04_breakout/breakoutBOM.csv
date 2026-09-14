@@ -1,0 +1,10 @@
+﻿Reference,Qty,Value,DNP,Exclude from BOM,Exclude from Board,Exclude from Simulation,Exclude from Position Files,Footprint,Datasheet
+C1,1,1nFC [0401|1005],0.01294,,,,${EXCLUDE_FROM_POS_FILES},Capacitor_SMD:C_0402_1005Metric,
+C2,1,.1uF,0.00622,,,,${EXCLUDE_FROM_POS_FILES},Capacitor_SMD:C_0201_0603Metric,
+C3,1,1uF,0.11860,,,,${EXCLUDE_FROM_POS_FILES},Capacitor_SMD:C_0201_0603Metric,
+C4,1,220nF,0.00874,,,,${EXCLUDE_FROM_POS_FILES},Capacitor_SMD:C_0402_1005Metric,
+J1,1,Conn_01x19_Pin,11.4,,,,${EXCLUDE_FROM_POS_FILES},Connector_PinHeader_2.54mm:PinHeader_1x10_P2.54mm_Vertical,
+R1,1,10k,0.01305,,,,${EXCLUDE_FROM_POS_FILES},Resistor_SMD:R_0201_0603Metric,https://www.vishay.com/docs/20035/dcrcwe3.pdf
+U1,1,ADS131M04IPWR,5.29,,,,${EXCLUDE_FROM_POS_FILES},Analog_DAC:PW20_TEX-L,https://www.ti.com/lit/gpn/ads131m04
+Y1,1,CB3LV-3I-8M192000,1.38,,9.292 each board,,${EXCLUDE_FROM_POS_FILES},Oscillator:OSC_CB3LV-3I-8M192000,
+,,,6.82081,with pins = 18.22081,w board wo pins = 16.11281,board w pins = 27.51281,,,

@@ -1,4 +1,6 @@
+pub mod adc;
 pub mod calibrate;
+pub mod load_bank;
 pub mod motor;
 pub mod pid;
 pub mod prime_mover;
