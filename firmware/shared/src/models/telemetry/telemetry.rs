@@ -257,13 +257,39 @@ pub enum EndBehavior {
     Loop,
 }
 
+/// A load-bank action fired WHEN elapsed time reaches a breakpoint. Lets a
+/// profile schedule load steps at specific times (e.g. "at t=5s apply half load,
+/// at t=10s go full, at t=15s shed"). The STM32 issues the corresponding
+/// LoadBank command at that instant, still enforcing the ordered state machine.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LoadAction {
+    /// Do nothing to the load at this point (default).
+    None,
+    /// Engage exactly Step 1 (half load) — sets bank level to One.
+    HalfLoad,
+    /// Engage Step 1 + Step 2 (full load) — sets bank level to Both.
+    FullLoad,
+    /// Shed one step gracefully (Both→One, or One→None).
+    StepDown,
+    /// Shed all load (bank level to None).
+    ShedAll,
+}
+
+impl Default for LoadAction {
+    fn default() -> Self {
+        LoadAction::None
+    }
+}
+
 /// One breakpoint. `interp` describes the segment from THIS point to the next
 /// (ignored on the final point — the tail is governed by EndBehavior).
+/// `load_action` fires once when elapsed time crosses this point's `t_ms`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProfilePoint {
     pub t_ms: u32,
     pub target_rpm: f32,
     pub interp: SegmentInterp,
+    pub load_action: LoadAction,
 }
 
 impl Default for ProfilePoint {
@@ -272,6 +298,7 @@ impl Default for ProfilePoint {
             t_ms: 0,
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         }
     }
 }
@@ -376,26 +403,31 @@ pub const DEFAULT_PROFILE: SetpointProfile = SetpointProfile {
             t_ms: 0,
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         }; MAX_PROFILE_POINTS];
         p[0] = ProfilePoint {
             t_ms: 0,
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         };
         p[1] = ProfilePoint {
             t_ms: 5000,
             target_rpm: 1500.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         };
         p[2] = ProfilePoint {
             t_ms: 25000,
             target_rpm: 1500.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         };
         p[3] = ProfilePoint {
             t_ms: 30000,
             target_rpm: 1800.0,
             interp: SegmentInterp::Linear,
+            load_action: LoadAction::None,
         };
         p
     },
