@@ -97,11 +97,11 @@ pub enum ChannelKind {
 //   (CLKIN is the external 8.192 MHz oscillator, wired to both chips — not an MCU pin.)
 // ═════════════════════════════════════════════════════════════════════════════
 
-pub type Cs1 = gpio::Pin<'D', 8, Output<PushPull>>;
-pub type Cs2 = gpio::Pin<'D', 9, Output<PushPull>>;
-pub type Drdy = gpio::Pin<'D', 10, Input>;
-pub type Sync = gpio::Pin<'D', 11, Output<PushPull>>;
-pub type Rst = gpio::Pin<'D', 12, Output<PushPull>>;
+pub type Cs1 = gpio::Pin<'D', 3, Output<PushPull>>;
+pub type Cs2 = gpio::Pin<'D', 4, Output<PushPull>>;
+pub type Drdy = gpio::Pin<'D', 5, Input>;
+pub type Sync = gpio::Pin<'D', 6, Output<PushPull>>;
+pub type Rst = gpio::Pin<'D', 7, Output<PushPull>>;
 
 /// The SPI1 peripheral, configured for the ADS131M04 (CPOL=0, CPHA=1, MSB first).
 pub type AdcSpi = stm32h7xx_hal::spi::Spi<stm32h7xx_hal::pac::SPI1, stm32h7xx_hal::spi::Enabled>;

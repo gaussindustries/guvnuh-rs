@@ -114,6 +114,7 @@ pub enum Fault {
     Overspeed,
     DeadlineMiss,
     LoadRejection,
+    EmergencyStop,
 }
 
 impl STATE {

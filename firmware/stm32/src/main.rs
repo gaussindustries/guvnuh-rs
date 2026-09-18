@@ -13,7 +13,7 @@ use rtic_monotonics::fugit::ExtU32;
 use rtic_monotonics::systick::prelude::*;
 use stm32h7xx_hal::{
     device::{TIM1, TIM2},
-    gpio::{self, ExtiPin, GpioExt, Output, PushPull},
+    gpio::{self, ExtiPin, GpioExt, Input, Output, PushPull},
     prelude::*,
     pwm,
     qei::Qei,
@@ -214,6 +214,7 @@ mod app {
         boot_hello_attempts: u32,
         adc_drdy: crate::guv::adc::Drdy,
         last_p_total: f32,
+        estop: gpio::Pin<'E', 6, Input>,
     }
 
     #[init]
@@ -285,6 +286,7 @@ mod app {
                 boot_hello_attempts: 0,
                 last_p_total: 0.0,
                 adc_drdy: board.adc_drdy,
+                estop: board.estop,
             },
         )
     }
@@ -297,13 +299,39 @@ mod app {
     // ────────────────────────────────────────────
     #[task(priority = 2,
         shared = [current_rpm, overspeed_limit, motor, relay,
-            state, last_fault, ld3, adc_acc, load_bank] ,
-        local = [last_p_total])]
+            state, last_fault, ld3, ld2, ld1, adc_acc, load_bank] ,
+        local = [last_p_total,estop])]
     async fn safety_supervisor(mut cx: safety_supervisor::Context) {
         const SUPERVISE_MS: u32 = 2; // 500 Hz
 
         loop {
             Mono::delay(SUPERVISE_MS.millis()).await;
+
+            // ── PHYSICAL E-STOP — highest priority, fail-safe ──
+            // Pin HIGH = E-stop (button pressed OR wire broken). LOW = closed/running.
+            let estop_active = cx.local.estop.is_high();
+
+            if estop_active {
+                // Kill everything immediately, every cycle it's held.
+                cx.shared.motor.lock(|m| m.emergency_off());
+                cx.shared.relay.lock(|r| r.set_low());
+                cx.shared.load_bank.lock(|lb| lb.emergency_shed());
+
+                // Transition to ESTOP on the edge (don't spam).
+                let already_estopped = cx.shared.state.lock(|s| matches!(*s, STATE::ESTOP));
+                if !already_estopped {
+                    defmt::error!("!! PHYSICAL E-STOP ENGAGED !!");
+                    cx.shared.state.lock(|s| *s = STATE::ESTOP);
+                    cx.shared
+                        .last_fault
+                        .lock(|f| *f = Some(Fault::EmergencyStop));
+                    cx.shared.ld3.lock(|l| l.set_high());
+                    cx.shared.ld1.lock(|l| l.set_low());
+                    cx.shared.ld2.lock(|l| l.set_low());
+                }
+                // Skip the rest of the supervisor while E-stopped — hold safe.
+                continue;
+            }
 
             let rpm = cx.shared.current_rpm.lock(|r| *r);
             let limit = cx.shared.overspeed_limit.lock(|l| *l);
@@ -1479,16 +1507,16 @@ mod app {
     //    corrupts RMS, but this is tiny. Uses a spare EXTI line binding for PD10.
     // ─────────────────────────────────────────────────────────────────────────────
 
-    #[task(binds = EXTI15_10, priority = 3, shared = [adc, adc_acc], local = [adc_drdy])]
-    fn adc_drdy_isr(mut cx: adc_drdy_isr::Context) {
-        if crate::guv::adc::ADC_HARDWARE_ENABLED {
-            cx.shared.adc.lock(|adc| {
-                let frame = adc.read_frame();
-                cx.shared.adc_acc.lock(|acc| acc.add(&frame));
-            });
-        }
-        cx.local.adc_drdy.clear_interrupt_pending_bit();
-    }
+    // #[task(binds = EXTI15_10, priority = 3, shared = [adc, adc_acc], local = [adc_drdy])]
+    // fn adc_drdy_isr(mut cx: adc_drdy_isr::Context) {
+    //     if crate::guv::adc::ADC_HARDWARE_ENABLED {
+    //         cx.shared.adc.lock(|adc| {
+    //             let frame = adc.read_frame();
+    //             cx.shared.adc_acc.lock(|acc| acc.add(&frame));
+    //         });
+    //     }
+    //     cx.local.adc_drdy.clear_interrupt_pending_bit();
+    // }
     // FUTURE — do not add until ADS131M04 is wired
     // #[task(priority = 1, shared = [encoder, measurements], local = [/* adc handle, sample buffer */])]
     // async fn measurement(mut cx: measurement::Context) {

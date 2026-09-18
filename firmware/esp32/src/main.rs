@@ -73,10 +73,11 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut led = Output::new(peripherals.GPIO2, Level::Low);
 
-    let mut uart1 = Uart::new(peripherals.UART1, Config::default())
+    let uart_config = Config::default().with_baudrate(115200);
+    let mut uart1 = Uart::new(peripherals.UART1, uart_config)
         .unwrap()
-        .with_tx(peripherals.GPIO17)
-        .with_rx(peripherals.GPIO16);
+        .with_tx(peripherals.GPIO23)
+        .with_rx(peripherals.GPIO22);
 
     println!("ESP32 Booted. Waiting for STM32 handshake...");
 

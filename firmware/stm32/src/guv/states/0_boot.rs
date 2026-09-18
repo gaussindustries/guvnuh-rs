@@ -1,6 +1,6 @@
 use stm32h7xx_hal::{
     device::{TIM1, TIM2},
-    gpio::{self, ExtiPin, Output, PushPull},
+    gpio::{self, ExtiPin, Input, Output, PushPull},
     pac,
     prelude::*,
     pwm,
@@ -17,6 +17,9 @@ pub struct Board {
     pub ld1: gpio::Pin<'B', 0, Output<PushPull>>,
     pub ld2: gpio::Pin<'E', 1, Output<PushPull>>,
     pub ld3: gpio::Pin<'B', 14, Output<PushPull>>,
+
+    //estop
+    pub estop: gpio::Pin<'E', 6, Input>,
 
     //this enables motor power, will be used in E-Stop
     pub motor_relay: gpio::Pin<'E', 0, Output<PushPull>>,
@@ -105,7 +108,8 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     motor_pwm.enable();
     motor_pwm.set_duty(motor_pwm.get_max_duty());
     defmt::info!("BOOT: PWM configured");
-
+    //estop
+    let estop = gpioe.pe6.into_pull_up_input();
     //relays
     let mut motor_relay = gpioe.pe0.into_push_pull_output();
     let mut load_step_1 = gpioe.pe15.into_push_pull_output();
@@ -124,14 +128,19 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     defmt::info!("BOOT: ADC pins configured");
     // CS1=PD8, CS2=PD9, DRDY=PD10(EXTI in), SYNC=PD11, RST=PD12
     // ─────────────────────────────────────────────────────────────────────────────
-    let mut adc_cs1 = gpiod.pd8.into_push_pull_output();
-    let mut adc_cs2 = gpiod.pd9.into_push_pull_output();
+    let mut adc_cs1 = gpiod.pd3.into_push_pull_output();
+    let mut adc_cs2 = gpiod.pd4.into_push_pull_output();
     adc_cs1.set_high(); // CS idle high (active low)
     adc_cs2.set_high();
-    let adc_sync = gpiod.pd11.into_push_pull_output();
-    let adc_rst = gpiod.pd12.into_push_pull_output();
+    let adc_sync = gpiod.pd6.into_push_pull_output();
+    let adc_rst = gpiod.pd7.into_push_pull_output();
 
-    let mut adc_drdy = gpiod.pd10.into_pull_up_input();
+    // pub type Cs1 = gpio::Pin<'D', 3, Output<PushPull>>;
+    // pub type Cs2 = gpio::Pin<'D', 4, Output<PushPull>>;
+    // pub type Drdy = gpio::Pin<'D', 5, Input>;
+    // pub type Sync = gpio::Pin<'D', 6, Output<PushPull>>;
+    // pub type Rst = gpio::Pin<'D', 7, Output<PushPull>>;
+    let mut adc_drdy = gpiod.pd5.into_pull_up_input();
     adc_drdy.make_interrupt_source(&mut dp.SYSCFG);
     adc_drdy.trigger_on_edge(&mut dp.EXTI, stm32h7xx_hal::gpio::Edge::Falling);
     if crate::guv::adc::ADC_HARDWARE_ENABLED {
@@ -182,6 +191,7 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
         ld1,
         ld2,
         ld3,
+        estop,
         motor_relay,
         load_step_1,
         load_step_2,
