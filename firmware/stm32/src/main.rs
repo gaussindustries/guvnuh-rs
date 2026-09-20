@@ -50,6 +50,7 @@ fn cmd_name(c: &Command) -> &'static str {
         Command::StepLoadUp => "StepLoadUp",
         Command::StepLoadDown => "StepLoadDown",
         Command::LoadProfile(_) => "LoadProfile",
+        Command::SetAlignPhase(_) => "SetAlignPhase",
     }
 }
 
@@ -81,8 +82,8 @@ fn enable_cycle_counter(dcb: &mut DCB, dwt: &mut DWT) {
 
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
 
-pub const LOAD_REJECT_DROP_W: f32 = 200.0; // W drop between 500Hz ticks = rejection
-pub const LOAD_REJECT_MIN_W: f32 = 100.0; // only arm the detector above this load
+pub const LOAD_REJECT_DROP_A: f32 = 2.0; // A drop in DC-bus current between 500Hz ticks = rejection
+pub const LOAD_REJECT_MIN_A: f32 = 1.0; // only arm the detector above this DC-bus current
 pub const DC_OVERVOLT_LIMIT: f32 = 300.0; // V — DC bus ceiling (tune to your rectifier)
 pub const DC_OVERCURRENT_LIMIT: f32 = 20.0; // A — DC bus current ceiling
 /// Active from boot with zero config — the autonomous-mode ceiling.
@@ -183,7 +184,7 @@ mod app {
         pub current_rpm: f32,
         pub last_fault: Option<Fault>,
         pub cmd_in: heapless::Deque<Command, 8>,
-
+        pub align_target: crate::guv::adc::AlignPhase,
         pub measurements: crate::models::measurements::Measurements,
 
         pub calibration: Option<crate::guv::calibrate::CalResult>,
@@ -240,6 +241,7 @@ mod app {
             board.adc_sync,
             board.adc_rst,
         );
+
         defmt::info!("INIT: Ads131Pair::new() complete");
         let load_bank = crate::guv::load_bank::LoadBank::new(board.load_step_1, board.load_step_2);
         state_manager::spawn().ok();
@@ -274,6 +276,7 @@ mod app {
                 adc,
                 adc_acc: crate::guv::adc::Accumulator::default(),
                 adc_meas: crate::guv::adc::Measurements::default(),
+                align_target: crate::guv::adc::AlignPhase::default(),
             },
             Local {
                 safety_init_done: false,
@@ -380,21 +383,23 @@ mod app {
                 .adc_acc
                 .lock(|acc| crate::guv::adc::finalize_protection(acc, 1.0));
 
-            // LOAD REJECTION: a sudden real-power drop → generator unloads →
+            // LOAD REJECTION: a sudden DC-bus CURRENT drop → generator unloaded →
             // overspeed hazard (critical for a turbine). React LOCALLY, now.
-            let last_p = *cx.local.last_p_total;
-            let p_drop = last_p - prot.p_total;
-            if last_p > crate::LOAD_REJECT_MIN_W && p_drop > crate::LOAD_REJECT_DROP_W {
+            // (Power isn't computed on-device anymore; rectifier current is the
+            //  load proxy — a big i_dc drop = load rejected. Same feedforward source.)
+            let last_i = *cx.local.last_p_total; // repurposed: last DC-bus current (A)
+            let i_drop = last_i - prot.i_dc;
+            if last_i > crate::LOAD_REJECT_MIN_A && i_drop > crate::LOAD_REJECT_DROP_A {
                 let already_faulted = cx
                     .shared
                     .state
                     .lock(|s| matches!(*s, STATE::FAULT | STATE::ESTOP));
                 if !already_faulted {
                     defmt::warn!(
-                        "!! LOAD REJECTION !! p {}W -> {}W (drop {}W)",
-                        last_p as i32,
-                        prot.p_total as i32,
-                        p_drop as i32
+                        "!! LOAD REJECTION !! i_dc {}A -> {}A (drop {}A)",
+                        last_i as i32,
+                        prot.i_dc as i32,
+                        i_drop as i32
                     );
                     // shed the bank immediately + go to fault.
                     cx.shared.load_bank.lock(|lb| lb.emergency_shed());
@@ -407,7 +412,7 @@ mod app {
                     cx.shared.ld3.lock(|l| l.set_high());
                 }
             }
-            *cx.local.last_p_total = prot.p_total;
+            *cx.local.last_p_total = prot.i_dc;
 
             // fast DC-bus electrical trips (local, no comms):
             if prot.v_dc > crate::DC_OVERVOLT_LIMIT || prot.i_dc > crate::DC_OVERCURRENT_LIMIT {
@@ -443,7 +448,7 @@ mod app {
     #[task(priority = 1,
         shared = [state, ld1, ld2, ld3, relay, load_bank, motor, tx, rx, run_config,
             current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile,
-            wcet, adc_acc,adc_meas],
+            wcet, adc_acc,adc_meas, align_target],
         local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
@@ -507,6 +512,21 @@ mod app {
                     };
                     cx.shared.load_bank.lock(|lb| lb.set_level(target));
                 }
+                Some(Command::SetAlignPhase(p)) => {
+                    let t = match p {
+                        shared::models::telemetry::telemetry::AlignPhase::A => {
+                            crate::guv::adc::AlignPhase::A
+                        }
+                        shared::models::telemetry::telemetry::AlignPhase::B => {
+                            crate::guv::adc::AlignPhase::B
+                        }
+                        shared::models::telemetry::telemetry::AlignPhase::C => {
+                            crate::guv::adc::AlignPhase::C
+                        }
+                    };
+                    cx.shared.align_target.lock(|a| *a = t);
+                    defmt::info!("Align target set to {}", t);
+                }
                 _ => {
                     // all other commands (Configure/Start/Stop/LiveAdjust/etc.) are handled
                     // by the state machine below — do nothing here, let them fall through.
@@ -514,10 +534,10 @@ mod app {
             }
 
             let _wcet_timer = CycleTimer::start();
-
+            let align = cx.shared.align_target.lock(|a| *a);
             // ── ADC full finalize: compute all scalars, store, reset the window ──
             let adc_m = cx.shared.adc_acc.lock(|acc| {
-                let m = crate::guv::adc::finalize_full(acc, 1.0);
+                let m = crate::guv::adc::finalize_full(acc, 1.0, align);
                 acc.reset(); // this task OWNS the reset (500Hz only reads partials)
                 m
             });
@@ -1348,7 +1368,7 @@ mod app {
     // ────────────────────────────────────────────
     //  RPM Monitor — encoder reading + telemetry
     // ────────────────────────────────────────────
-    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault, measurements, pending_report, adc_meas, load_bank])]
+    #[task(priority = 1, shared = [encoder, tx, state, current_rpm, motor, run_config, last_fault, measurements, pending_report, adc_meas, load_bank, align_target])]
     async fn telemetry_task(mut cx: telemetry_task::Context) {
         let mut last_count: u32 = 0;
         let counts_per_rev: f32 = 8192.0;
@@ -1396,29 +1416,40 @@ mod app {
                                 shared::models::telemetry::telemetry::LoadLevel::Both
                             }
                         };
-                        // ── assembly: frame is built FROM measurements ──
+                        // map the selected align target to its wire enum
+                        let align_wire = cx.shared.align_target.lock(|a| match *a {
+                            crate::guv::adc::AlignPhase::A => {
+                                shared::models::telemetry::telemetry::AlignPhase::A
+                            }
+                            crate::guv::adc::AlignPhase::B => {
+                                shared::models::telemetry::telemetry::AlignPhase::B
+                            }
+                            crate::guv::adc::AlignPhase::C => {
+                                shared::models::telemetry::telemetry::AlignPhase::C
+                            }
+                        });
+
+                        // ── assembly: frame is built FROM the ADC measurements ──
                         let frame = shared::models::telemetry::telemetry::Telemetry {
                             ts_ms,
                             state: *state,
                             rpm: meas.rpm,
                             duty_percent: motor.demand(),
-                            // legacy fields now fed from ADC (phase A / totals):
-                            v_gen_rms: adc_m.v_a_rms,
-                            i_gen_rms: adc_m.i_a_rms,
-                            freq_gen_hz: adc_m.freq_hz,
-                            theta_err_rad: 0.0,
-                            temp_c: meas.temp_c,
-                            dc_bus_v: adc_m.v_dc,
-                            // NEW 3-phase fields:
+                            // phase alignment (chip 1 — reference + 3 motor phases):
+                            v_ref_rms: adc_m.v_ref_rms,
                             v_a_rms: adc_m.v_a_rms,
                             v_b_rms: adc_m.v_b_rms,
                             v_c_rms: adc_m.v_c_rms,
-                            i_a_rms: adc_m.i_a_rms,
-                            i_b_rms: adc_m.i_b_rms,
-                            i_c_rms: adc_m.i_c_rms,
-                            p_total_w: adc_m.p_total,
-                            pf: adc_m.pf,
-                            dc_bus_i: adc_m.i_dc,
+                            phase_err_a: adc_m.phase_err_a,
+                            phase_err_b: adc_m.phase_err_b,
+                            phase_err_c: adc_m.phase_err_c,
+                            theta_err_rad: adc_m.phase_err_selected,
+                            align_phase: align_wire,
+                            // rectifier DC bus (chip 2) + line frequency:
+                            v_dc: adc_m.v_dc,
+                            i_dc: adc_m.i_dc,
+                            freq_hz: adc_m.freq_hz,
+                            temp_c: meas.temp_c,
                             load_level: wire_load,
                             run_mode: run_config.map(|c| c.mode),
                             fault: *last_fault,

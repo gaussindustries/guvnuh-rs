@@ -74,6 +74,21 @@ impl Default for LoadLevel {
     }
 }
 
+/// Which motor phase the PLL aligns the reference to. Selected from the terminal
+/// via Command::SetAlignPhase. Mirrors crate::guv::adc::AlignPhase on the wire.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AlignPhase {
+    A,
+    B,
+    C,
+}
+
+impl Default for AlignPhase {
+    fn default() -> Self {
+        AlignPhase::A
+    }
+}
+
 /// Single telemetry sample — canonical wire format.
 /// Serialized via postcard/COBS over UART, deserialized on the server.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -83,26 +98,24 @@ pub struct Telemetry {
     pub rpm: f32,
     pub duty_percent: f32,
 
-    // (kept; now = phase A / totals so old UI still works) ──
-    pub v_gen_rms: f32,   // = v_a_rms (phase A) — legacy field
-    pub i_gen_rms: f32,   // = i_a_rms
-    pub freq_gen_hz: f32, // = freq_hz
-    pub theta_err_rad: f32,
-    pub temp_c: f32,
-    pub dc_bus_v: f32, // = v_dc
-
-    // full 3-phase from the dual ADS131M04 ──
-    pub v_a_rms: f32,
+    // ── phase alignment (dual ADS131M04, chip 1 = coherent AC voltages) ──
+    pub v_ref_rms: f32, // reference channel magnitude (VFD single-phase or mains)
+    pub v_a_rms: f32,   // motor phase A/B/C voltage magnitudes
     pub v_b_rms: f32,
     pub v_c_rms: f32,
-    pub i_a_rms: f32,
-    pub i_b_rms: f32,
-    pub i_c_rms: f32,
-    pub p_total_w: f32, // total real power — the load-rejection sentinel
-    pub pf: f32,        // total power factor
-    pub dc_bus_i: f32,  // DC bus current (rectifier output)
+    pub phase_err_a: f32, // each phase's error vs reference (rad, ±π)
+    pub phase_err_b: f32,
+    pub phase_err_c: f32,
+    pub theta_err_rad: f32, // = selected phase's error (what PLL_LOCK closes)
+    pub align_phase: AlignPhase, // which phase is currently selected
 
-    // load bank state (so terminal shows which steps are engaged) ──
+    // ── rectifier DC bus (chip 2) + line frequency ──
+    pub v_dc: f32,    // rectifier DC bus voltage
+    pub i_dc: f32,    // rectifier DC bus current (load-feedforward source)
+    pub freq_hz: f32, // line frequency (from the reference channel)
+    pub temp_c: f32,
+
+    // ── load bank state (which steps engaged) ──
     pub load_level: LoadLevel,
 
     pub run_mode: Option<RunMode>,
@@ -225,6 +238,8 @@ pub enum Command {
     StepLoadDown,
     /// Set an explicit load level; STM32 takes the correct ordered path there.
     SetLoad(LoadLevel),
+    /// Select which motor phase (A/B/C) the PLL aligns the reference to.
+    SetAlignPhase(AlignPhase),
     LoadProfile(SetpointProfile),
 }
 

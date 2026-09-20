@@ -1,143 +1,67 @@
-// (combined driver — part1 + part2 merged into guv/adc.rs)
+// (combined adc.rs — SPI driver + phase-alignment measurement layer)
 // ═════════════════════════════════════════════════════════════════════════════
-// DUAL ADS131M04 DRIVER — 3-phase power measurement front-end
+// DUAL ADS131M04 DRIVER + PHASE-ALIGNMENT MEASUREMENT
 //
-// SYSTEM ROLE (per the architecture split):
-//   The STM32 samples the 3-phase AC waveforms + DC bus FAST, and computes the
-//   CONTROL-CRITICAL electrical scalars locally: per-phase RMS V/I, real power,
-//   power factor, frequency, DC bus V/I. These are CONTROL INPUTS, not just
-//   telemetry — a governor's whole job is matching mechanical input to
-//   electrical output, so it must KNOW the electrical output in real time, and
-//   the fastest/most-dangerous failure modes (load rejection → overspeed, esp.
-//   for a steam turbine) are detected FROM these computed values and must be
-//   handled LOCALLY with no terminal round-trip.
-//
-//   The STM32 does NOT do analytical work (harmonics, THD, spectra, trends) —
-//   that's the terminal's job, from the shipped scalars. STM32 runs the machine;
-//   ESP32 relays; terminal analyzes.
-//
-// TWO CHIPS, ONE BUS, COHERENT SAMPLING:
-//   Two ADS131M04s share SPI1 (SCK/MISO/MOSI) with separate CS lines. Their SYNC
-//   pins are tied → both sample SIMULTANEOUSLY (coherent), essential for real
-//   power (V×I must be sampled at the same instant per phase). Readout is
-//   sequential over the shared bus; sampling is synchronized by SYNC.
-//
-//   Chip #1: Ch0-2 = phase A/B/C VOLTAGE, Ch3 = DC bus VOLTAGE
-//   Chip #2: Ch0-2 = phase A/B/C CURRENT, Ch3 = DC bus CURRENT
-//
-// CLKIN: external 8.192 MHz oscillator (CTS CB3LV-3C-8M192000) feeds both chips.
+// Two ADS131M04 24-bit delta-sigma ADCs share SPI1 with separate CS lines and
+// tied SYNC (coherent sampling). Chip1 carries the AC voltages used for phase
+// alignment (reference + 3 motor phases); Chip2 carries the rectifier DC bus.
+// The external 8.192 MHz oscillator (CTS CB3LV) must feed both CLKIN pins or the
+// ADCs never sample.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #![allow(dead_code)]
 
-use libm::sqrt;
-use stm32h7xx_hal::{
-    gpio::{self, Input, Output, PushPull},
-    hal::blocking::spi::Transfer,
-};
-pub const ADC_HARDWARE_ENABLED: bool = false;
+use stm32h7xx_hal::gpio::{self, Input, Output, PushPull};
+// Bring the blocking SPI Transfer trait into scope for spi.transfer(&mut buf).
+// (cortex_m re-exports the embedded-hal 0.2 blocking traits under this alias.)
+use cortex_m::prelude::_embedded_hal_blocking_spi_Transfer as _;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// TUNABLE: ADC sample rate — see the big comment. Editable knob trading ADC
-// fidelity vs. CPU/ISR load. The DRDY pin fires at this rate.
-//
+// Master enable: false until the ADC chips + 8.192 MHz oscillator are wired.
+// When false, Ads131Pair::new() skips the blocking SPI config and the DRDY
+// interrupt is left un-armed (see 0_boot.rs), so the board boots clean with the
+// ADC dormant and telemetry electrical fields read 0.
+// ─────────────────────────────────────────────────────────────────────────────
+pub const ADC_HARDWARE_ENABLED: bool = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TUNABLE: ADC sample rate (SPS per channel). The DRDY pin fires at this rate.
 //   Samples per 60 Hz cycle = ADC_SAMPLE_RATE / 60
-//     2000 SPS ≈ 33 samples/cycle  → solid RMS/power, lightest CPU
-//     4000 SPS ≈ 67 samples/cycle  → good RMS + low-order harmonics (DEFAULT)
-//     8000 SPS ≈ 133 samples/cycle → harmonics headroom, heavier ISR
-//
-// The ADS131M04's own output data rate (ODR) is set by OSR (oversampling ratio)
-// against the 8.192 MHz CLKIN: ODR = CLKIN / (2 * OSR * 2). Pick OSR to land near
-// ADC_SAMPLE_RATE (see osr_for_rate below). Tune against measured WCET — the
-// control-loop deadline instrumentation shows the ISR + finalize cost. At 64 MHz
-// sysclk, if the loop tightens, drop to 2000; if you need on-device harmonics,
-// raise to 8000 (and confirm the ISR still fits the budget).
+//     2000 → 33/cycle (light)   4000 → 67/cycle (default)   8000 → 133/cycle
+// Faster = finer phase resolution + better RMS, but heavier ISR. Validate WCET.
 // ─────────────────────────────────────────────────────────────────────────────
 pub const ADC_SAMPLE_RATE: u32 = 4000; // SPS per channel
-
 pub const AC_LINE_HZ: f32 = 60.0;
-/// Samples accumulated per 60 Hz cycle at the current rate.
 pub const SAMPLES_PER_CYCLE: u32 = ADC_SAMPLE_RATE / (AC_LINE_HZ as u32);
 
-// ── ADS131M04 register map (subset we use) ──
+// ── ADS131M04 register map (subset) ──
 const REG_ID: u8 = 0x00;
 const REG_STATUS: u8 = 0x01;
 const REG_MODE: u8 = 0x02;
 const REG_CLOCK: u8 = 0x03;
-const REG_GAIN1: u8 = 0x04; // PGA gain for ch0-3
+const REG_GAIN1: u8 = 0x04;
 const REG_CFG: u8 = 0x06;
-// per-channel config base (CHx_CFG at 0x09 + 5*x)
-const REG_CH0_CFG: u8 = 0x09;
 
-// SPI commands
 const CMD_NULL: u16 = 0x0000;
 const CMD_RESET: u16 = 0x0011;
 const CMD_STANDBY: u16 = 0x0022;
 const CMD_WAKEUP: u16 = 0x0033;
-// RREG / WREG are 011a aaaa accc cccc — built in helpers below.
 
-/// Which physical quantity a channel carries, for scaling raw counts → SI units.
-#[derive(Clone, Copy)]
-pub enum ChannelKind {
-    PhaseVoltage, // via PT / iso-amp
-    PhaseCurrent, // via CT + burden
-    DcVoltage,    // via divider
-    DcCurrent,    // via shunt + INA240
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// PIN ASSIGNMENTS (control lines) — placed on the free PD bank + PA5/6/7 for SPI1.
-//
-//   SPI1:  SCK = PA5, MISO = PA6, MOSI = PA7   (AF5)
-//   CS1  = PD8   (chip #1 chip-select, active low)
-//   CS2  = PD9   (chip #2 chip-select, active low)
-//   DRDY = PD10  (data-ready, shared — both chips DRDY tied; falling edge = new frame)
-//   SYNC = PD11  (sync/reset, tied to both chips — drives coherent sampling)
-//   RST  = PD12  (hardware reset, tied to both chips, active low)
-//
-//   (CLKIN is the external 8.192 MHz oscillator, wired to both chips — not an MCU pin.)
-// ═════════════════════════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────────────────────────────────────────
+// PIN ASSIGNMENTS (match 0_boot.rs):
+//   SPI1: SCK=PA5, MISO=PA6, MOSI=PA7 (AF5)
+//   CS1=PD3, CS2=PD4, DRDY=PD5 (EXTI), SYNC=PD6, RST=PD7
+//   CLKIN = external 8.192 MHz oscillator to both chips (not an MCU pin)
+// ─────────────────────────────────────────────────────────────────────────────
 pub type Cs1 = gpio::Pin<'D', 3, Output<PushPull>>;
 pub type Cs2 = gpio::Pin<'D', 4, Output<PushPull>>;
 pub type Drdy = gpio::Pin<'D', 5, Input>;
 pub type Sync = gpio::Pin<'D', 6, Output<PushPull>>;
 pub type Rst = gpio::Pin<'D', 7, Output<PushPull>>;
 
-/// The SPI1 peripheral, configured for the ADS131M04 (CPOL=0, CPHA=1, MSB first).
 pub type AdcSpi = stm32h7xx_hal::spi::Spi<stm32h7xx_hal::pac::SPI1, stm32h7xx_hal::spi::Enabled>;
 
-// ═════════════════════════════════════════════════════════════════════════════
-// SCALING — raw 24-bit counts → SI units. FILL THESE IN once the front-end
-// (PT/CT/divider/shunt+INA240 values) is finalized. Each is: full-scale volts at
-// the ADC pin × the external divider/transformer/shunt ratio ÷ ADC counts.
-//
-// ADS131M04: ±1.2 V differential full-scale at gain=1 → 2^23 counts = 1.2 V.
-// So volts_at_pin = raw_counts * (1.2 / 8_388_608.0) / gain.
-// Then multiply by the front-end ratio to get the real-world quantity.
-// ═════════════════════════════════════════════════════════════════════════════
-const ADC_FS_VOLTS: f32 = 1.2;
-const ADC_COUNTS: f32 = 8_388_608.0; // 2^23
-
-// PLACEHOLDER ratios — replace with your measured/designed front-end values:
-const PHASE_V_RATIO: f32 = 1.0; // (PT ratio × iso-amp gain) → real phase volts per pin-volt
-const PHASE_I_RATIO: f32 = 1.0; // (CT ratio / burden) → real amps per pin-volt
-const DC_V_RATIO: f32 = 1.0; //    (divider ratio) → real DC volts per pin-volt
-const DC_I_RATIO: f32 = 1.0; //    (1 / (shunt × INA240 gain)) → real amps per pin-volt
-
-#[inline]
-fn counts_to_pin_volts(raw: i32, gain: f32) -> f32 {
-    (raw as f32) * (ADC_FS_VOLTS / ADC_COUNTS) / gain
-}
-
-// (continued in part 2 — driver struct, config, ISR, accumulation, finalize)
-// ═════════════════════════════════════════════════════════════════════════════
-// DUAL ADS131M04 DRIVER — Part 2: driver, accumulation, finalize
-// (continues adc_ads131m04_part1.rs — same module)
-// ═════════════════════════════════════════════════════════════════════════════
-
 // ── RREG/WREG command builders ──
-// WREG: 011 aaaaa a ccccccc  → 0x6000 | (addr<<7) | (count-1)
-// RREG: 101 aaaaa a ccccccc  → 0xA000 | (addr<<7) | (count-1)
 #[inline]
 fn wreg_cmd(addr: u8, count: u8) -> u16 {
     0x6000 | ((addr as u16) << 7) | ((count as u16) - 1)
@@ -147,131 +71,54 @@ fn rreg_cmd(addr: u8, count: u8) -> u16 {
     0xA000 | ((addr as u16) << 7) | ((count as u16) - 1)
 }
 
-/// One coherent sample set: all 8 channels, both chips, same instant.
-/// Chip1 = voltages (A,B,C,DC), Chip2 = currents (A,B,C,DC).
-#[derive(Clone, Copy, Default)]
-pub struct RawFrame {
-    pub v_a: i32,
-    pub v_b: i32,
-    pub v_c: i32,
-    pub v_dc: i32,
-    pub i_a: i32,
-    pub i_b: i32,
-    pub i_c: i32,
-    pub i_dc: i32,
-}
-
-/// Running accumulators between finalize calls. The ISR adds each sample's
-/// squared value (for RMS) and V*I product (for real power). No divide/sqrt in
-/// the ISR — that happens in finalize. Uses i64/f64 accumulators to avoid
-/// overflow/precision loss over thousands of samples.
-#[derive(Clone, Copy, Default)]
-pub struct Accumulator {
-    // sum of squares, per channel, for RMS
-    pub sq_v_a: f64,
-    pub sq_v_b: f64,
-    pub sq_v_c: f64,
-    pub sq_i_a: f64,
-    pub sq_i_b: f64,
-    pub sq_i_c: f64,
-    // sum of V*I products, per phase, for real power
-    pub p_a: f64,
-    pub p_b: f64,
-    pub p_c: f64,
-    // DC bus: simple running sum (DC → mean, not RMS)
-    pub sum_v_dc: f64,
-    pub sum_i_dc: f64,
-    // count of samples accumulated
-    pub n: u32,
-    // ── frequency detection: zero-crossing tracking on phase A voltage ──
-    pub last_v_a_sign: i8, // sign of previous v_a sample (+1/-1)
-    pub crossings: u32,    // rising zero-crossings counted this window
-}
-
-impl Accumulator {
-    #[inline]
-    pub fn reset(&mut self) {
-        *self = Accumulator {
-            last_v_a_sign: self.last_v_a_sign, // carry sign across windows for continuity
-            ..Default::default()
-        };
-    }
-
-    /// Add one coherent sample (called from the DRDY ISR — keep LEAN).
-    #[inline]
-    pub fn add(&mut self, f: &RawFrame) {
-        let va = f.v_a as f64;
-        let vb = f.v_b as f64;
-        let vc = f.v_c as f64;
-        let ia = f.i_a as f64;
-        let ib = f.i_b as f64;
-        let ic = f.i_c as f64;
-
-        self.sq_v_a += va * va;
-        self.sq_v_b += vb * vb;
-        self.sq_v_c += vc * vc;
-        self.sq_i_a += ia * ia;
-        self.sq_i_b += ib * ib;
-        self.sq_i_c += ic * ic;
-
-        self.p_a += va * ia;
-        self.p_b += vb * ib;
-        self.p_c += vc * ic;
-
-        self.sum_v_dc += f.v_dc as f64;
-        self.sum_i_dc += f.i_dc as f64;
-
-        // rising zero-crossing on phase A voltage → frequency
-        let sign: i8 = if va >= 0.0 { 1 } else { -1 };
-        if self.last_v_a_sign < 0 && sign > 0 {
-            self.crossings += 1;
-        }
-        self.last_v_a_sign = sign;
-
-        self.n = self.n.wrapping_add(1);
+/// Map desired sample rate → OSR register bits. With 8.192 MHz CLKIN:
+/// OSR=1024 → 4000 SPS, OSR=2048 → 2000, OSR=512 → 8000.
+fn osr_bits_for_rate(rate: u32) -> u16 {
+    match rate {
+        r if r >= 8000 => 0b010, // OSR 512  → 8000 SPS
+        r if r >= 4000 => 0b011, // OSR 1024 → 4000 SPS (default)
+        _ => 0b100,              // OSR 2048 → 2000 SPS
     }
 }
 
-/// Finalized electrical scalars — the CONTROL-CRITICAL measurements the STM32
-/// computes locally and both (a) acts on for control/protection and (b) ships
-/// via telemetry. All SI units.
-#[derive(Clone, Copy, Default, defmt::Format)]
-pub struct Measurements {
-    pub v_a_rms: f32,
-    pub v_b_rms: f32,
-    pub v_c_rms: f32,
-    pub i_a_rms: f32,
-    pub i_b_rms: f32,
-    pub i_c_rms: f32,
-    pub p_a: f32, // real power per phase (W)
-    pub p_b: f32,
-    pub p_c: f32,
-    pub p_total: f32, // total real power (W) — the load-rejection sentinel
-    pub pf: f32,      // total power factor
-    pub v_dc: f32,    // DC bus voltage (V)
-    pub i_dc: f32,    // DC bus current (A)
-    pub freq_hz: f32, // output frequency (Hz)
+/// Big-endian 24-bit two's-complement bytes → i32 (sign-extended).
+#[inline]
+fn be24_to_i32(b: &[u8]) -> i32 {
+    let raw = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+    if raw & 0x0080_0000 != 0 {
+        (raw | 0xFF00_0000) as i32
+    } else {
+        raw as i32
+    }
 }
 
-/// The driver: owns SPI + control pins + the shared accumulator.
+#[derive(Clone, Copy)]
+enum Chip {
+    One,
+    Two,
+}
+
+/// The driver: owns SPI + control pins.
 pub struct Ads131Pair {
     spi: AdcSpi,
     cs1: Cs1,
     cs2: Cs2,
     sync: Sync,
     rst: Rst,
-    gain: f32, // PGA gain applied to all channels (config below)
+    gain: f32,
 }
 
 impl Ads131Pair {
-    /// Construct + configure both chips. Call once in init (after SPI + pins built
-    /// in 0_boot). Does hardware reset, sets mode/clock/gain, enables channels.
+    /// Construct + (conditionally) configure both chips. When ADC_HARDWARE_ENABLED
+    /// is false, skips the blocking SPI config so the board boots with the ADC
+    /// absent.
     pub fn new(spi: AdcSpi, cs1: Cs1, cs2: Cs2, mut sync: Sync, mut rst: Rst) -> Self {
+        // hardware reset both chips (RST tied, active low)
         rst.set_low();
-        cortex_m::asm::delay(64_000);
+        cortex_m::asm::delay(64_000); // ~1ms at 64MHz
         rst.set_high();
-        cortex_m::asm::delay(640_000);
-        sync.set_high();
+        cortex_m::asm::delay(640_000); // ~10ms settle
+        sync.set_high(); // SYNC high = normal
 
         let mut me = Self {
             spi,
@@ -281,30 +128,25 @@ impl Ads131Pair {
             rst,
             gain: 1.0,
         };
+        me.cs1.set_high();
+        me.cs2.set_high();
 
         if ADC_HARDWARE_ENABLED {
-            me.configure(); // SPI register writes — only when the chips can respond
+            me.configure();
         } else {
             defmt::warn!("ADS131M04 DISABLED (ADC_HARDWARE_ENABLED=false) — SPI config skipped");
         }
         me
     }
 
-    /// Configure both chips identically: gain, OSR (→ sample rate), channel enable.
+    /// Configure both chips identically: OSR (→ sample rate), gain, channel enable.
     fn configure(&mut self) {
-        // OSR chosen so ODR ≈ ADC_SAMPLE_RATE. See osr_for_rate.
         let osr_bits = osr_bits_for_rate(ADC_SAMPLE_RATE);
-        // MODE / CLOCK / GAIN register values — see datasheet §. These are the
-        // key ones; adjust bit-fields to your exact needs.
-        // CLOCK reg: set OSR field + enable all 4 channels.
-        let clock_val: u16 = 0x000E | (osr_bits << 2) /* OSR */ ;
-        // GAIN1: gain=1 for all channels (bits per channel). 0 = gain 1.
-        let gain_val: u16 = 0x0000;
-
+        let clock_val: u16 = 0x000E | (osr_bits << 2); // enable 4 ch + OSR
+        let gain_val: u16 = 0x0000; // gain 1 all channels
         for chip in [Chip::One, Chip::Two] {
             self.write_reg(chip, REG_CLOCK, clock_val);
             self.write_reg(chip, REG_GAIN1, gain_val);
-            // MODE reg: default (24-bit words, etc.) — write if you need to change.
         }
         self.gain = 1.0;
         defmt::info!(
@@ -315,34 +157,26 @@ impl Ads131Pair {
     }
 
     /// Read one coherent frame from BOTH chips. Called from the DRDY ISR.
-    /// The ADS131M04 frame is: STATUS word + 4 channel words (24-bit each) + CRC.
-    /// We read chip1 (voltages) then chip2 (currents) over the shared bus.
+    ///   Chip1 → [ref, v_a, v_b, v_c]   Chip2 → [v_dc, i_dc, spare, spare]
     pub fn read_frame(&mut self) -> RawFrame {
-        let v = self.read_chip(Chip::One); // [ch0..ch3] = v_a,v_b,v_c,v_dc
-        let i = self.read_chip(Chip::Two); // [ch0..ch3] = i_a,i_b,i_c,i_dc
+        let c1 = self.read_chip(Chip::One);
+        let c2 = self.read_chip(Chip::Two);
         RawFrame {
-            v_a: v[0],
-            v_b: v[1],
-            v_c: v[2],
-            v_dc: v[3],
-            i_a: i[0],
-            i_b: i[1],
-            i_c: i[2],
-            i_dc: i[3],
+            v_ref: c1[0],
+            v_a: c1[1],
+            v_b: c1[2],
+            v_c: c1[3],
+            v_dc: c2[0],
+            i_dc: c2[1],
         }
     }
 
-    /// Read the 4 channel words from one chip. Frame = status + 4×24bit + crc.
-    /// At 24-bit word size that's 6 words of 3 bytes = 18 bytes.
+    /// Read the 4 channel words from one chip. Frame = status + 4×24bit + crc = 18 bytes.
     fn read_chip(&mut self, chip: Chip) -> [i32; 4] {
         self.select(chip, true);
-        // send NULL command, clock out the full frame.
-        let mut buf = [0u8; 18]; // status(3) + 4ch(3 each = 12) + crc(3)
-                                 // TX all-zeros (NULL cmd), RX the frame.
+        let mut buf = [0u8; 18];
         let _ = self.spi.transfer(&mut buf);
         self.select(chip, false);
-
-        // words: [0..3]=status, [3..6]=ch0, [6..9]=ch1, [9..12]=ch2, [12..15]=ch3, [15..18]=crc
         [
             be24_to_i32(&buf[3..6]),
             be24_to_i32(&buf[6..9]),
@@ -357,7 +191,7 @@ impl Ads131Pair {
         let mut tx = [
             (cmd >> 8) as u8,
             (cmd & 0xFF) as u8,
-            0, // pad to 24-bit word
+            0,
             (val >> 8) as u8,
             (val & 0xFF) as u8,
             0,
@@ -368,7 +202,6 @@ impl Ads131Pair {
 
     #[inline]
     fn select(&mut self, chip: Chip, active: bool) {
-        // CS active low
         match chip {
             Chip::One => {
                 if active {
@@ -388,120 +221,263 @@ impl Ads131Pair {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Chip {
-    One,
-    Two,
+// ═════════════════════════════════════════════════════════════════════════════
+// (measurement layer follows — appended below)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Which motor phase the PLL aligns the reference to. Set from the terminal via
+/// Command::SetAlignPhase; defaults to A. Mirror this enum in the shared crate
+/// so the wire Command can carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+pub enum AlignPhase {
+    A,
+    B,
+    C,
 }
 
-/// Big-endian 24-bit two's-complement bytes → i32 (sign-extended).
+impl Default for AlignPhase {
+    fn default() -> Self {
+        AlignPhase::A
+    }
+}
+
+/// One coherent sample set. Chip1 = reference + 3 motor phase voltages (sampled
+/// the same instant, so phase differences are meaningful). Chip2 = rectifier DC.
+#[derive(Clone, Copy, Default)]
+pub struct RawFrame {
+    pub v_ref: i32, // reference phase (chip1 ch0)
+    pub v_a: i32,   // motor phase A   (chip1 ch1)
+    pub v_b: i32,   // motor phase B   (chip1 ch2)
+    pub v_c: i32,   // motor phase C   (chip1 ch3)
+    pub v_dc: i32,  // rectifier DC voltage (chip2 ch0)
+    pub i_dc: i32,  // rectifier DC current (chip2 ch1)
+                    // chip2 ch2/ch3 spare — add fields here when you wire them.
+}
+
+/// Per-channel zero-crossing tracker. Records the fractional sample index of the
+/// most recent RISING zero-crossing within the current window, for phase math.
+#[derive(Clone, Copy, Default)]
+struct CrossTracker {
+    last_sign: i8,       // sign of previous sample (+1 / -1)
+    last_cross_idx: f32, // sample index of most recent rising crossing this window
+    have_cross: bool,    // saw at least one crossing this window
+    crossings: u32,      // rising crossings this window (for frequency)
+}
+
+impl CrossTracker {
+    #[inline]
+    fn add(&mut self, sample: f64, idx: u32) {
+        let sign: i8 = if sample >= 0.0 { 1 } else { -1 };
+        if self.last_sign < 0 && sign > 0 {
+            // rising zero-crossing between (idx-1) and idx. Linear-interpolate the
+            // sub-sample crossing point isn't tracked here (we use the integer idx);
+            // for finer phase, interpolate using prev/cur magnitudes.
+            self.last_cross_idx = idx as f32;
+            self.have_cross = true;
+            self.crossings += 1;
+        }
+        self.last_sign = sign;
+    }
+    #[inline]
+    fn reset_window(&mut self) {
+        // keep last_sign for continuity across windows; clear per-window state.
+        self.have_cross = false;
+        self.crossings = 0;
+    }
+}
+
+/// Running accumulators between finalize calls. Tracks RMS (sum-of-squares) for
+/// magnitudes AND zero-crossings for phase alignment. Kept lean — no divide/sqrt
+/// in the ISR; those happen in finalize.
+#[derive(Clone, Copy, Default)]
+pub struct Accumulator {
+    // sum of squares for RMS magnitudes
+    pub sq_ref: f64,
+    pub sq_a: f64,
+    pub sq_b: f64,
+    pub sq_c: f64,
+    // DC-bus running sums (mean, not RMS)
+    pub sum_v_dc: f64,
+    pub sum_i_dc: f64,
+    // zero-crossing trackers (phase alignment)
+    x_ref: CrossTracker,
+    x_a: CrossTracker,
+    x_b: CrossTracker,
+    x_c: CrossTracker,
+    // sample count this window
+    pub n: u32,
+}
+
+impl Accumulator {
+    #[inline]
+    pub fn reset(&mut self) {
+        self.sq_ref = 0.0;
+        self.sq_a = 0.0;
+        self.sq_b = 0.0;
+        self.sq_c = 0.0;
+        self.sum_v_dc = 0.0;
+        self.sum_i_dc = 0.0;
+        self.x_ref.reset_window();
+        self.x_a.reset_window();
+        self.x_b.reset_window();
+        self.x_c.reset_window();
+        self.n = 0;
+    }
+
+    /// Add one coherent sample (called from the DRDY ISR — keep LEAN).
+    #[inline]
+    pub fn add(&mut self, f: &RawFrame) {
+        let vr = f.v_ref as f64;
+        let va = f.v_a as f64;
+        let vb = f.v_b as f64;
+        let vc = f.v_c as f64;
+
+        self.sq_ref += vr * vr;
+        self.sq_a += va * va;
+        self.sq_b += vb * vb;
+        self.sq_c += vc * vc;
+
+        self.sum_v_dc += f.v_dc as f64;
+        self.sum_i_dc += f.i_dc as f64;
+
+        let idx = self.n;
+        self.x_ref.add(vr, idx);
+        self.x_a.add(va, idx);
+        self.x_b.add(vb, idx);
+        self.x_c.add(vc, idx);
+
+        self.n = self.n.wrapping_add(1);
+    }
+}
+
+/// Finalized electrical + alignment scalars. Shipped in telemetry and used by
+/// the control loop (PLL_LOCK reads theta_err_rad; the governor reads i_dc for
+/// feedforward and v_dc for protection).
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct Measurements {
+    // magnitudes (RMS, SI volts/amps after scaling)
+    pub v_ref_rms: f32,
+    pub v_a_rms: f32,
+    pub v_b_rms: f32,
+    pub v_c_rms: f32,
+    pub v_dc: f32,
+    pub i_dc: f32,
+    pub freq_hz: f32, // line frequency from the reference channel
+
+    // phase error (radians, wrapped ±π) of each motor phase RELATIVE to reference.
+    // Positive = phase leads reference. PLL drives the SELECTED one to zero.
+    pub phase_err_a: f32,
+    pub phase_err_b: f32,
+    pub phase_err_c: f32,
+    /// The error for the currently-selected align target — this is theta_err_rad.
+    pub phase_err_selected: f32,
+}
+
+// ── scaling helpers (fill ratios once the front-end is built) ──
+const ADC_FS_VOLTS: f32 = 1.2;
+const ADC_COUNTS: f32 = 8_388_608.0; // 2^23
+
+// PLACEHOLDER ratios — replace with your measured divider/PT/shunt values:
+const REF_V_RATIO: f32 = 1.0; // reference-phase divider/PT → real volts per pin-volt
+const PHASE_V_RATIO: f32 = 1.0; // motor-phase divider/PT
+const DC_V_RATIO: f32 = 1.0; // DC-bus divider
+const DC_I_RATIO: f32 = 1.0; // 1 / (shunt × INA240 gain) → real amps per pin-volt
+
 #[inline]
-fn be24_to_i32(b: &[u8]) -> i32 {
-    let raw = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
-    // sign-extend 24→32
-    if raw & 0x0080_0000 != 0 {
-        (raw | 0xFF00_0000) as i32
-    } else {
-        raw as i32
-    }
+fn counts_to_pin_volts(raw: f64, gain: f32) -> f32 {
+    (raw as f32) * (ADC_FS_VOLTS / ADC_COUNTS) / gain
 }
 
-/// Map desired sample rate → OSR register bits (ODR = CLKIN / (2 * OSR)). With
-/// 8.192 MHz CLKIN: OSR=1024 → 4000 SPS, OSR=2048 → 2000, OSR=512 → 8000.
-fn osr_bits_for_rate(rate: u32) -> u16 {
-    match rate {
-        r if r >= 8000 => 0b010, // OSR 512  → 8000 SPS
-        r if r >= 4000 => 0b011, // OSR 1024 → 4000 SPS (default)
-        _ => 0b100,              // OSR 2048 → 2000 SPS
-    }
+#[inline]
+fn rms_counts(sq: f64, n: f64) -> f64 {
+    libm::sqrt(sq / n)
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// FINALIZE — turn accumulated sums into SI scalars. Two entry points at two
-// rates, per the protection-vs-control split.
-// ═════════════════════════════════════════════════════════════════════════════
+/// Wrap a phase difference (radians) into ±π.
+#[inline]
+fn wrap_pi(mut x: f32) -> f32 {
+    use core::f32::consts::PI;
+    while x > PI {
+        x -= 2.0 * PI;
+    }
+    while x < -PI {
+        x += 2.0 * PI;
+    }
+    x
+}
 
-/// FULL finalize (called at the 100 Hz control tick): all scalars for governing
-/// + telemetry. Consumes the accumulator (caller resets after).
-pub fn finalize_full(acc: &Accumulator, gain: f32) -> Measurements {
+/// Phase error of a target channel vs the reference, in radians. Uses the
+/// difference in rising-crossing sample index over one window, scaled to the
+/// samples-per-cycle. Returns 0 if either lacks a crossing this window.
+#[inline]
+fn phase_err(target: &CrossTracker, reference: &CrossTracker) -> f32 {
+    use core::f32::consts::PI;
+    if !target.have_cross || !reference.have_cross {
+        return 0.0;
+    }
+    let samples_per_cycle = SAMPLES_PER_CYCLE as f32;
+    let d_samples = target.last_cross_idx - reference.last_cross_idx;
+    let err = (d_samples / samples_per_cycle) * 2.0 * PI;
+    wrap_pi(err)
+}
+
+/// FULL finalize (100 Hz control tick): magnitudes + all phase errors + the
+/// selected error. `align` picks which phase's error becomes phase_err_selected
+/// (→ theta_err_rad). Caller resets the accumulator after.
+pub fn finalize_full(acc: &Accumulator, gain: f32, align: AlignPhase) -> Measurements {
     if acc.n == 0 {
         return Measurements::default();
     }
     let n = acc.n as f64;
-    let scale_v = |sq: f64, ratio: f32| -> f32 {
-        // RMS in pin-volts, then × front-end ratio
-        let rms_counts = sqrt(sq / n);
-        counts_to_pin_volts(rms_counts as i32, gain) * ratio
-    };
-    // NOTE: converting the sqrt(mean-square) of counts via counts_to_pin_volts is
-    // approximate (it treats the RMS count as a raw count); for exactness, scale
-    // per-sample. Kept compact here — refine if you need lab-grade accuracy.
 
-    let v_a_rms = scale_v(acc.sq_v_a, PHASE_V_RATIO);
-    let v_b_rms = scale_v(acc.sq_v_b, PHASE_V_RATIO);
-    let v_c_rms = scale_v(acc.sq_v_c, PHASE_V_RATIO);
-    let i_a_rms = scale_v(acc.sq_i_a, PHASE_I_RATIO);
-    let i_b_rms = scale_v(acc.sq_i_b, PHASE_I_RATIO);
-    let i_c_rms = scale_v(acc.sq_i_c, PHASE_I_RATIO);
+    let v_ref_rms = counts_to_pin_volts(rms_counts(acc.sq_ref, n), gain) * REF_V_RATIO;
+    let v_a_rms = counts_to_pin_volts(rms_counts(acc.sq_a, n), gain) * PHASE_V_RATIO;
+    let v_b_rms = counts_to_pin_volts(rms_counts(acc.sq_b, n), gain) * PHASE_V_RATIO;
+    let v_c_rms = counts_to_pin_volts(rms_counts(acc.sq_c, n), gain) * PHASE_V_RATIO;
 
-    // real power per phase: mean of (V*I) products, scaled by both ratios
-    let vscale = (ADC_FS_VOLTS / ADC_COUNTS) / gain;
-    let p_scale = vscale * vscale * (PHASE_V_RATIO * PHASE_I_RATIO);
-    let p_a = ((acc.p_a / n) * p_scale as f64) as f32;
-    let p_b = ((acc.p_b / n) * p_scale as f64) as f32;
-    let p_c = ((acc.p_c / n) * p_scale as f64) as f32;
-    let p_total = p_a + p_b + p_c;
+    let v_dc = counts_to_pin_volts(acc.sum_v_dc / n, gain) * DC_V_RATIO;
+    let i_dc = counts_to_pin_volts(acc.sum_i_dc / n, gain) * DC_I_RATIO;
 
-    // apparent power for PF
-    let s_total = v_a_rms * i_a_rms + v_b_rms * i_b_rms + v_c_rms * i_c_rms;
-    let pf = if s_total.abs() > f32::EPSILON {
-        (p_total / s_total).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
-
-    // DC bus: mean of counts → pin volts → ratio
-    let v_dc = counts_to_pin_volts((acc.sum_v_dc / n) as i32, gain) * DC_V_RATIO;
-    let i_dc = counts_to_pin_volts((acc.sum_i_dc / n) as i32, gain) * DC_I_RATIO;
-
-    // frequency: rising crossings over the sample window → Hz
-    // window duration = n / ADC_SAMPLE_RATE seconds; freq = crossings / duration
+    // frequency from the reference channel's crossings over the window
     let window_s = n / (ADC_SAMPLE_RATE as f64);
     let freq_hz = if window_s > 0.0 {
-        (acc.crossings as f64 / window_s) as f32
+        (acc.x_ref.crossings as f64 / window_s) as f32
     } else {
         0.0
+    };
+
+    // phase errors of each motor phase vs the reference
+    let phase_err_a = phase_err(&acc.x_a, &acc.x_ref);
+    let phase_err_b = phase_err(&acc.x_b, &acc.x_ref);
+    let phase_err_c = phase_err(&acc.x_c, &acc.x_ref);
+    let phase_err_selected = match align {
+        AlignPhase::A => phase_err_a,
+        AlignPhase::B => phase_err_b,
+        AlignPhase::C => phase_err_c,
     };
 
     Measurements {
+        v_ref_rms,
         v_a_rms,
         v_b_rms,
         v_c_rms,
-        i_a_rms,
-        i_b_rms,
-        i_c_rms,
-        p_a,
-        p_b,
-        p_c,
-        p_total,
-        pf,
         v_dc,
         i_dc,
         freq_hz,
+        phase_err_a,
+        phase_err_b,
+        phase_err_c,
+        phase_err_selected,
     }
 }
 
-/// FAST protection subset (called at 500 Hz alongside the overspeed task): only
-/// the safety-critical scalars needed to catch fast failure modes LOCALLY —
-/// total real power (load-rejection sentinel), DC bus voltage (overvoltage), DC
-/// current (overcurrent), frequency (overspeed corroboration). Cheaper than the
-/// full finalize; does NOT reset the accumulator (the 100Hz full finalize owns
-/// the reset), so this reads the running partial sums.
+/// FAST protection subset (500 Hz, with the overspeed supervisor): DC bus V/I
+/// (over-volt/over-current + the feedforward source) + line frequency. Does NOT
+/// reset the accumulator (the 100 Hz finalize owns the reset).
 #[derive(Clone, Copy, Default, defmt::Format)]
 pub struct ProtectionScalars {
-    pub p_total: f32,
     pub v_dc: f32,
-    pub i_dc: f32,
+    pub i_dc: f32, // ← load-feedforward source: rising i_dc = load increasing
     pub freq_hz: f32,
 }
 
@@ -510,21 +486,31 @@ pub fn finalize_protection(acc: &Accumulator, gain: f32) -> ProtectionScalars {
         return ProtectionScalars::default();
     }
     let n = acc.n as f64;
-    let vscale = (ADC_FS_VOLTS / ADC_COUNTS) / gain;
-    let p_scale = vscale * vscale * (PHASE_V_RATIO * PHASE_I_RATIO);
-    let p_total = (((acc.p_a + acc.p_b + acc.p_c) / n) * p_scale as f64) as f32;
-    let v_dc = counts_to_pin_volts((acc.sum_v_dc / n) as i32, gain) * DC_V_RATIO;
-    let i_dc = counts_to_pin_volts((acc.sum_i_dc / n) as i32, gain) * DC_I_RATIO;
+    let v_dc = counts_to_pin_volts(acc.sum_v_dc / n, gain) * DC_V_RATIO;
+    let i_dc = counts_to_pin_volts(acc.sum_i_dc / n, gain) * DC_I_RATIO;
     let window_s = n / (ADC_SAMPLE_RATE as f64);
     let freq_hz = if window_s > 0.0 {
-        (acc.crossings as f64 / window_s) as f32
+        (acc.x_ref.crossings as f64 / window_s) as f32
     } else {
         0.0
     };
     ProtectionScalars {
-        p_total,
         v_dc,
         i_dc,
         freq_hz,
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// read_frame — update the channel mapping in Ads131Pair::read_frame to:
+//
+//   pub fn read_frame(&mut self) -> RawFrame {
+//       let c1 = self.read_chip(Chip::One); // [ref, v_a, v_b, v_c]
+//       let c2 = self.read_chip(Chip::Two); // [v_dc, i_dc, spare, spare]
+//       RawFrame {
+//           v_ref: c1[0], v_a: c1[1], v_b: c1[2], v_c: c1[3],
+//           v_dc:  c2[0], i_dc: c2[1],
+//       }
+//   }
+//
+// ═════════════════════════════════════════════════════════════════════════════
