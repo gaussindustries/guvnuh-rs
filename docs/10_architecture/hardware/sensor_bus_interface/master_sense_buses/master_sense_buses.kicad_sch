@@ -2349,6 +2349,196 @@
 			)
 			(embedded_fonts no)
 		)
+		(symbol "Switch:SW_SPDT"
+			(pin_names
+				(offset 0)
+				(hide yes)
+			)
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(in_pos_files yes)
+			(duplicate_pin_numbers_are_jumpers no)
+			(property "Reference" "SW"
+				(at 0 5.08 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Value" "SW_SPDT"
+				(at 0 -5.08 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Footprint" ""
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Datasheet" ""
+				(at 0 -7.62 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Description" "Switch, single pole double throw"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "ki_keywords" "switch single-pole double-throw spdt ON-ON"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(symbol "SW_SPDT_0_1"
+				(circle
+					(center -2.032 0)
+					(radius 0.4572)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(polyline
+					(pts
+						(xy -1.651 0.254) (xy 1.651 2.286)
+					)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 2.032 2.54)
+					(radius 0.4572)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 2.032 -2.54)
+					(radius 0.4572)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+			)
+			(symbol "SW_SPDT_1_1"
+				(rectangle
+					(start -3.175 3.81)
+					(end 3.175 -3.81)
+					(stroke
+						(width 0)
+						(type default)
+					)
+					(fill
+						(type background)
+					)
+				)
+				(pin passive line
+					(at 5.08 2.54 180)
+					(length 2.54)
+					(name "A"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin passive line
+					(at -5.08 0 0)
+					(length 2.54)
+					(name "B"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin passive line
+					(at 5.08 -2.54 180)
+					(length 2.54)
+					(name "C"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "3"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+			)
+			(embedded_fonts no)
+		)
 		(symbol "amc1302dwv:AMC1302DWV"
 			(pin_names
 				(offset 0.254)
@@ -4114,6 +4304,12 @@
 		(uuid "5c35ddde-fb53-45e5-aab0-bece9267aceb")
 	)
 	(junction
+		(at 245.11 123.19)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "5cc08ebe-0e09-4420-90a3-89f9f7abb87a")
+	)
+	(junction
 		(at 229.87 50.8)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -4132,12 +4328,6 @@
 		(uuid "706cd8f7-2da8-44cd-a6bc-f9ce7daf3dc7")
 	)
 	(junction
-		(at 250.19 123.19)
-		(diameter 0)
-		(color 0 0 0 0)
-		(uuid "74dcb6c6-5e18-4d06-b819-a7abb559e75c")
-	)
-	(junction
 		(at 229.87 39.37)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -4154,6 +4344,12 @@
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "77e8662a-8623-4148-a06f-e09eb9e703ed")
+	)
+	(junction
+		(at 250.19 123.19)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "78ba8bd9-cd08-4030-8af5-4038e7711a8f")
 	)
 	(junction
 		(at 140.97 130.81)
@@ -4575,6 +4771,16 @@
 	)
 	(wire
 		(pts
+			(xy 245.11 123.19) (xy 250.19 123.19)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "211ba9b0-6d1c-4660-914b-59f7963b2807")
+	)
+	(wire
+		(pts
 			(xy 160.02 114.3) (xy 147.32 114.3)
 		)
 		(stroke
@@ -4682,6 +4888,16 @@
 			(type default)
 		)
 		(uuid "347a962f-a947-4af1-aea3-32db83eade8a")
+	)
+	(wire
+		(pts
+			(xy 234.95 151.13) (xy 255.27 151.13)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "368751cd-eec8-4e06-965e-25d398f8b6a9")
 	)
 	(wire
 		(pts
@@ -5035,6 +5251,16 @@
 	)
 	(wire
 		(pts
+			(xy 271.78 142.24) (xy 255.27 142.24)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6b2ad295-32b0-4b8d-8437-84a0e926d05a")
+	)
+	(wire
+		(pts
 			(xy 59.69 46.99) (xy 86.36 46.99)
 		)
 		(stroke
@@ -5182,16 +5408,6 @@
 			(type default)
 		)
 		(uuid "85289d34-ec02-459c-825b-c0bdcfb4b862")
-	)
-	(wire
-		(pts
-			(xy 271.78 142.24) (xy 255.27 142.24)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "8567bd9c-f7de-4ca7-8735-e36c0f55e70c")
 	)
 	(wire
 		(pts
@@ -5482,6 +5698,16 @@
 			(type default)
 		)
 		(uuid "acf29b6c-cb3a-460e-89d8-3c3be4eeb440")
+	)
+	(wire
+		(pts
+			(xy 255.27 142.24) (xy 255.27 151.13)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "aef3fd68-6324-4202-b849-a1ae52d8891d")
 	)
 	(wire
 		(pts
@@ -5845,16 +6071,6 @@
 	)
 	(wire
 		(pts
-			(xy 255.27 142.24) (xy 255.27 151.13)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "e5366861-9457-474f-a747-fd4911eb7599")
-	)
-	(wire
-		(pts
 			(xy 158.75 58.42) (xy 158.75 31.75)
 		)
 		(stroke
@@ -5865,7 +6081,7 @@
 	)
 	(wire
 		(pts
-			(xy 237.49 123.19) (xy 250.19 123.19)
+			(xy 237.49 123.19) (xy 245.11 123.19)
 		)
 		(stroke
 			(width 0)
@@ -5952,16 +6168,6 @@
 			(type default)
 		)
 		(uuid "f35233ef-c8c8-433d-b5d8-fa87affc4f43")
-	)
-	(wire
-		(pts
-			(xy 255.27 151.13) (xy 234.95 151.13)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "f4cf2582-8683-4e0a-bbde-68559d4e0f87")
 	)
 	(wire
 		(pts
@@ -8374,7 +8580,7 @@
 	)
 	(symbol
 		(lib_id "power:VDC")
-		(at 250.19 130.81 180)
+		(at 247.65 140.97 180)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -8385,7 +8591,7 @@
 		(fields_autoplaced yes)
 		(uuid "39f2f934-7aa9-4514-9727-64db0ffb7dfa")
 		(property "Reference" "#PWR050"
-			(at 250.19 127 0)
+			(at 247.65 137.16 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8396,7 +8602,7 @@
 			)
 		)
 		(property "Value" "0.6 VDC RAIL"
-			(at 250.19 135.89 0)
+			(at 247.65 146.05 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -8406,7 +8612,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 250.19 130.81 0)
+			(at 247.65 140.97 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8417,7 +8623,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 250.19 130.81 0)
+			(at 247.65 140.97 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8428,7 +8634,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"VDC\""
-			(at 250.19 130.81 0)
+			(at 247.65 140.97 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11420,6 +11626,98 @@
 	)
 	(symbol
 		(lib_id "SparkFun-Resistor:R")
+		(at 250.19 127 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "74f0cf89-e8e5-4161-8f3e-c78f8e906dbc")
+		(property "Reference" "R41"
+			(at 252.476 125.984 90)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Value" "1.54kΩ"
+			(at 252.476 128.524 90)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Footprint" "SparkFun-Resistor:R_0603_1608Metric"
+			(at 254.762 127 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" "https://www.vishay.com/docs/20035/dcrcwe3.pdf"
+			(at 259.08 128.27 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Resistor"
+			(at 261.62 127 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "PROD_ID" "RES-07856"
+			(at 257.048 127 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "29022273-87f1-438b-a8b1-1f9eb846f687")
+		)
+		(pin "2"
+			(uuid "d4a5cc06-fa9c-4b4c-b78c-f7f4a297f854")
+		)
+		(instances
+			(project "master_sense_buses"
+				(path "/b64a929e-7a8b-44c9-a2ae-ae2740f738e8"
+					(reference "R41")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "SparkFun-Resistor:R")
 		(at 180.34 66.04 0)
 		(unit 1)
 		(body_style 1)
@@ -13779,7 +14077,7 @@
 	)
 	(symbol
 		(lib_id "SparkFun-Resistor:R")
-		(at 250.19 127 90)
+		(at 245.11 127 90)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -13787,10 +14085,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(fields_autoplaced yes)
 		(uuid "a60bd157-8002-40ba-972f-9fc026d26ec2")
 		(property "Reference" "R38"
-			(at 252.73 125.7299 90)
+			(at 238.252 118.11 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -13801,7 +14098,7 @@
 			)
 		)
 		(property "Value" "2.94kΩ (E96)"
-			(at 252.73 128.2699 90)
+			(at 238.252 120.65 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -13812,7 +14109,7 @@
 			)
 		)
 		(property "Footprint" "SparkFun-Resistor:R_0603_1608Metric"
-			(at 254.762 127 0)
+			(at 249.682 127 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -13823,7 +14120,7 @@
 			)
 		)
 		(property "Datasheet" "https://www.vishay.com/docs/20035/dcrcwe3.pdf"
-			(at 259.08 128.27 0)
+			(at 254 128.27 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -13834,7 +14131,7 @@
 			)
 		)
 		(property "Description" "Resistor"
-			(at 261.62 127 0)
+			(at 256.54 127 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -13845,7 +14142,7 @@
 			)
 		)
 		(property "PROD_ID" "RES-07856"
-			(at 257.048 127 0)
+			(at 251.968 127 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -16822,6 +17119,91 @@
 			(project "master_sense_buses"
 				(path "/b64a929e-7a8b-44c9-a2ae-ae2740f738e8"
 					(reference "#PWR011")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Switch:SW_SPDT")
+		(at 247.65 135.89 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "f4b2d264-7e98-4eea-ab9f-fe6f6464d7cc")
+		(property "Reference" "SW1"
+			(at 252.73 134.6199 90)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Value" "SW_115D-230S"
+			(at 252.73 137.1599 90)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Footprint" ""
+			(at 247.65 135.89 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 255.27 135.89 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Switch, single pole double throw"
+			(at 247.65 135.89 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "3"
+			(uuid "7b27681c-1720-420b-8745-7376310dda5d")
+		)
+		(pin "2"
+			(uuid "01467e32-7c5d-4ebc-bc1c-9ec08bef5651")
+		)
+		(pin "1"
+			(uuid "1badd1be-75d4-41ae-8125-92951b7b6453")
+		)
+		(instances
+			(project "master_sense_buses"
+				(path "/b64a929e-7a8b-44c9-a2ae-ae2740f738e8"
+					(reference "SW1")
 					(unit 1)
 				)
 			)
