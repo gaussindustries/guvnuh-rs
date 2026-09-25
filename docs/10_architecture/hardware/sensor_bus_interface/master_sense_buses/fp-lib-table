@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "assets") (type "KiCad") (uri "/home/gauss/Projects/gaussindustri.es/assets.pretty") (options "") (descr ""))
+)
