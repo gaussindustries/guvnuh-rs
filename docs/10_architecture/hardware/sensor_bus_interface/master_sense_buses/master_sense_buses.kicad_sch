@@ -3992,6 +3992,12 @@
 		(uuid "1a29e0b6-db42-4506-91f4-359408600afb")
 	)
 	(junction
+		(at 194.31 68.58)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "1d47f4fe-ca4c-4d77-b271-54fd6d6ed9a0")
+	)
+	(junction
 		(at 50.8 76.2)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -8464,7 +8470,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 194.31 140.97 270)
+		(at 194.31 148.59 180)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -8474,7 +8480,7 @@
 		(dnp no)
 		(uuid "3a57d589-ce5e-4ac5-af0e-c15321d99f21")
 		(property "Reference" "#PWR013"
-			(at 187.96 140.97 0)
+			(at 194.31 142.24 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8485,7 +8491,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 189.484 140.97 90)
+			(at 194.31 143.764 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -8495,7 +8501,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 194.31 140.97 0)
+			(at 194.31 148.59 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8506,7 +8512,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 194.31 140.97 0)
+			(at 194.31 148.59 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8517,7 +8523,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 194.31 140.97 0)
+			(at 194.31 148.59 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11510,7 +11516,7 @@
 	)
 	(symbol
 		(lib_id "power:+3.3V")
-		(at 194.2043 68.58 90)
+		(at 194.31 68.58 90)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11521,7 +11527,7 @@
 		(fields_autoplaced yes)
 		(uuid "781717cc-c05c-4de9-8042-7dd052933b3c")
 		(property "Reference" "#PWR027"
-			(at 198.0143 68.58 0)
+			(at 198.12 68.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11532,7 +11538,7 @@
 			)
 		)
 		(property "Value" "+3.3V"
-			(at 190.3943 68.5799 90)
+			(at 190.5 68.5799 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11543,7 +11549,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 194.2043 68.58 0)
+			(at 194.31 68.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11554,7 +11560,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 194.2043 68.58 0)
+			(at 194.31 68.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11565,7 +11571,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"+3.3V\""
-			(at 194.2043 68.58 0)
+			(at 194.31 68.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)

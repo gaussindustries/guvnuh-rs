@@ -266,8 +266,10 @@ struct CrossTracker {
 
 impl CrossTracker {
     #[inline]
-    fn add(&mut self, sample: f64, idx: u32) {
-        let sign: i8 = if sample >= 0.0 { 1 } else { -1 };
+    fn add(&mut self, sample: f64, bias: f64, idx: u32) {
+        // Compare against the channel's DC bias (the ~0.6 V AC offset), not 0, so a
+        // biased-up AC still zero-crosses. `bias` is the previous window's mean.
+        let sign: i8 = if (sample - bias) >= 0.0 { 1 } else { -1 };
         if self.last_sign < 0 && sign > 0 {
             // rising zero-crossing between (idx-1) and idx. Linear-interpolate the
             // sub-sample crossing point isn't tracked here (we use the integer idx);
@@ -296,6 +298,11 @@ pub struct Accumulator {
     pub sq_a: f64,
     pub sq_b: f64,
     pub sq_c: f64,
+    // AC running sums → per-window mean, to remove the ~0.6 V bias from RMS
+    pub sum_ref: f64,
+    pub sum_a: f64,
+    pub sum_b: f64,
+    pub sum_c: f64,
     // DC-bus running sums (mean, not RMS)
     pub sum_v_dc: f64,
     pub sum_i_dc: f64,
@@ -304,6 +311,11 @@ pub struct Accumulator {
     x_a: CrossTracker,
     x_b: CrossTracker,
     x_c: CrossTracker,
+    // carried AC means (previous window) used as this window's zero-crossing bias
+    bias_ref: f64,
+    bias_a: f64,
+    bias_b: f64,
+    bias_c: f64,
     // sample count this window
     pub n: u32,
 }
@@ -311,10 +323,25 @@ pub struct Accumulator {
 impl Accumulator {
     #[inline]
     pub fn reset(&mut self) {
+        // Carry each AC channel's mean forward as next window's zero-crossing bias.
+        // First window (n==0) leaves bias at 0.0 → that one window reports no
+        // crossings (freq/phase = 0) until seeded; RMS is already correct from
+        // window 1 because ac_rms_counts subtracts the window's own mean.
+        if self.n > 0 {
+            let n = self.n as f64;
+            self.bias_ref = self.sum_ref / n;
+            self.bias_a = self.sum_a / n;
+            self.bias_b = self.sum_b / n;
+            self.bias_c = self.sum_c / n;
+        }
         self.sq_ref = 0.0;
         self.sq_a = 0.0;
         self.sq_b = 0.0;
         self.sq_c = 0.0;
+        self.sum_ref = 0.0;
+        self.sum_a = 0.0;
+        self.sum_b = 0.0;
+        self.sum_c = 0.0;
         self.sum_v_dc = 0.0;
         self.sum_i_dc = 0.0;
         self.x_ref.reset_window();
@@ -337,14 +364,19 @@ impl Accumulator {
         self.sq_b += vb * vb;
         self.sq_c += vc * vc;
 
+        self.sum_ref += vr;
+        self.sum_a += va;
+        self.sum_b += vb;
+        self.sum_c += vc;
+
         self.sum_v_dc += f.v_dc as f64;
         self.sum_i_dc += f.i_dc as f64;
 
         let idx = self.n;
-        self.x_ref.add(vr, idx);
-        self.x_a.add(va, idx);
-        self.x_b.add(vb, idx);
-        self.x_c.add(vc, idx);
+        self.x_ref.add(vr, self.bias_ref, idx);
+        self.x_a.add(va, self.bias_a, idx);
+        self.x_b.add(vb, self.bias_b, idx);
+        self.x_c.add(vc, self.bias_c, idx);
 
         self.n = self.n.wrapping_add(1);
     }
@@ -377,20 +409,29 @@ pub struct Measurements {
 const ADC_FS_VOLTS: f32 = 1.2;
 const ADC_COUNTS: f32 = 8_388_608.0; // 2^23
 
-// PLACEHOLDER ratios — replace with your measured divider/PT/shunt values:
-const REF_V_RATIO: f32 = 1.0; // reference-phase divider/PT → real volts per pin-volt
-const PHASE_V_RATIO: f32 = 1.0; // motor-phase divider/PT
-const DC_V_RATIO: f32 = 1.0; // DC-bus divider
-const DC_I_RATIO: f32 = 1.0; // 1 / (shunt × INA240 gain) → real amps per pin-volt
+// Front-end scaling. RATIO = real-world units per pin-volt (ADS differential volt).
+// Voltage channels (AMC1311, gain 1): RATIO = (Rtop + Rbot) / Rbot  [inverse divider].
+//   Rtop = 3×330k = 990k on every voltage channel. Trim each against a known
+//   applied input before trusting absolute magnitudes.
+const REF_V_RATIO: f32 = 337.7; // reference = 120 V mains, Rbot 2.94k → (990k+2.94k)/2.94k
+                                //   230 V jumper option (Rbot 1.54k): use 643.9
+const PHASE_V_RATIO: f32 = 496.0; // motor phases, Rbot 2.00k → (990k+2.00k)/2.00k
+const DC_V_RATIO: f32 = 337.7; // DC bus, Rbot 2.94k → (990k+2.94k)/2.94k
+                               // DC current: shunt 0.1Ω × AMC1302 gain 41 = 4.1 V/A → RATIO = 1/(0.1×41).
+const DC_I_RATIO: f32 = 0.243_90; // amps per pin-volt (0.1Ω shunt, AMC1302 ×41)
 
 #[inline]
 fn counts_to_pin_volts(raw: f64, gain: f32) -> f32 {
     (raw as f32) * (ADC_FS_VOLTS / ADC_COUNTS) / gain
 }
 
+/// True AC RMS in counts: sqrt(mean(x²) − mean(x)²). Subtracting the mean removes
+/// the ~0.6 V DC bias on the AC channels so RMS reflects the AC component only.
 #[inline]
-fn rms_counts(sq: f64, n: f64) -> f64 {
-    libm::sqrt(sq / n)
+fn ac_rms_counts(sq: f64, sum: f64, n: f64) -> f64 {
+    let mean = sum / n;
+    let var = sq / n - mean * mean;
+    libm::sqrt(if var > 0.0 { var } else { 0.0 })
 }
 
 /// Wrap a phase difference (radians) into ±π.
@@ -430,10 +471,11 @@ pub fn finalize_full(acc: &Accumulator, gain: f32, align: AlignPhase) -> Measure
     }
     let n = acc.n as f64;
 
-    let v_ref_rms = counts_to_pin_volts(rms_counts(acc.sq_ref, n), gain) * REF_V_RATIO;
-    let v_a_rms = counts_to_pin_volts(rms_counts(acc.sq_a, n), gain) * PHASE_V_RATIO;
-    let v_b_rms = counts_to_pin_volts(rms_counts(acc.sq_b, n), gain) * PHASE_V_RATIO;
-    let v_c_rms = counts_to_pin_volts(rms_counts(acc.sq_c, n), gain) * PHASE_V_RATIO;
+    let v_ref_rms =
+        counts_to_pin_volts(ac_rms_counts(acc.sq_ref, acc.sum_ref, n), gain) * REF_V_RATIO;
+    let v_a_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_a, acc.sum_a, n), gain) * PHASE_V_RATIO;
+    let v_b_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_b, acc.sum_b, n), gain) * PHASE_V_RATIO;
+    let v_c_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_c, acc.sum_c, n), gain) * PHASE_V_RATIO;
 
     let v_dc = counts_to_pin_volts(acc.sum_v_dc / n, gain) * DC_V_RATIO;
     let i_dc = counts_to_pin_volts(acc.sum_i_dc / n, gain) * DC_I_RATIO;
