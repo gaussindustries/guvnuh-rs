@@ -206,13 +206,15 @@ mod app {
     #[local]
     pub struct Local {
         safety_init_done: bool,
-        cmd_buf: [u8; 128], // owned by the UART4 ISR
+        // Sized for the largest Command: a LoadProfile always encodes all
+        // MAX_PROFILE_POINTS slots (~200 B COBS), so 128 B dropped every profile.
+        cmd_buf: [u8; shared::models::telemetry::telemetry::PROFILE_CMD_BUF], // owned by the UART4 ISR
         cmd_len: usize,
         pid: crate::guv::pid::PidController,
         ramp: Option<crate::guv::ramp::Ramp>,
         run_elapsed_ms: u32,
         /// Profile clock value on the previous SPOOLUP tick — edge-detects which
-        /// breakpoints were crossed so each load_action fires exactly once.
+        /// breakpoints were crossed so each action fires exactly once.
         profile_prev_ms: Option<u32>,
         calibrator: Option<crate::guv::calibrate::Calibrator>,
         boot_hello_attempts: u32,
@@ -283,7 +285,7 @@ mod app {
             },
             Local {
                 safety_init_done: false,
-                cmd_buf: [0u8; 128],
+                cmd_buf: [0u8; shared::models::telemetry::telemetry::PROFILE_CMD_BUF],
                 cmd_len: 0,
                 pid: crate::guv::pid::PidController::new(PidGains::default()),
                 ramp: None,
@@ -891,8 +893,8 @@ mod app {
                     // skip the classic ramp entirely for closed-loop modes.
                     let has_profile = cx.shared.active_profile.lock(|ap| ap.is_some());
 
-                    // ── Profile-scheduled load steps ──
-                    // Fire each breakpoint's load_action once, as the profile clock
+                    // ── Profile-scheduled load steps + phase alignment ──
+                    // Fire each breakpoint's actions once, as the profile clock
                     // crosses it — same clock and same modes that drive the RPM
                     // target below. The LoadBank still enforces the ordered path.
                     if has_profile && matches!(config.mode, RunMode::ClosedLoop | RunMode::Generate)
@@ -905,28 +907,48 @@ mod app {
                         };
                         let profile = cx.shared.active_profile.lock(|ap| *ap);
                         if let Some(p) = profile {
-                            shared::models::telemetry::telemetry::for_each_load_action(
+                            shared::models::telemetry::telemetry::for_each_crossed_point(
                                 &p,
                                 prev,
                                 elapsed,
-                                |act| {
+                                |pt| {
+                                    use crate::guv::adc::AlignPhase as AA;
                                     use crate::guv::load_bank::LoadLevel as LL;
-                                    use shared::models::telemetry::telemetry::LoadAction as LA;
-                                    let name = match act {
-                                        LA::None => "None",
-                                        LA::HalfLoad => "HalfLoad",
-                                        LA::FullLoad => "FullLoad",
-                                        LA::StepDown => "StepDown",
-                                        LA::ShedAll => "ShedAll",
+                                    use shared::models::telemetry::telemetry::{
+                                        AlignPhase as WA, LoadAction as LA,
                                     };
-                                    defmt::info!("Profile t={}ms → load {=str}", elapsed, name);
-                                    cx.shared.load_bank.lock(|lb| match act {
-                                        LA::None => {}
-                                        LA::HalfLoad => lb.set_level(LL::One),
-                                        LA::FullLoad => lb.set_level(LL::Both),
-                                        LA::StepDown => lb.step_down(),
-                                        LA::ShedAll => lb.set_level(LL::None),
-                                    });
+
+                                    let load_name = match pt.load_action {
+                                        LA::None => None,
+                                        LA::HalfLoad => Some("HalfLoad"),
+                                        LA::FullLoad => Some("FullLoad"),
+                                        LA::StepDown => Some("StepDown"),
+                                        LA::ShedAll => Some("ShedAll"),
+                                    };
+                                    if let Some(name) = load_name {
+                                        defmt::info!("Profile t={}ms → load {=str}", elapsed, name);
+                                        cx.shared.load_bank.lock(|lb| match pt.load_action {
+                                            LA::None => {}
+                                            LA::HalfLoad => lb.set_level(LL::One),
+                                            LA::FullLoad => lb.set_level(LL::Both),
+                                            LA::StepDown => lb.step_down(),
+                                            LA::ShedAll => lb.set_level(LL::None),
+                                        });
+                                    }
+
+                                    if let Some(ph) = pt.align_phase {
+                                        let (target, name) = match ph {
+                                            WA::A => (AA::A, "A"),
+                                            WA::B => (AA::B, "B"),
+                                            WA::C => (AA::C, "C"),
+                                        };
+                                        defmt::info!(
+                                            "Profile t={}ms → align phase {=str}",
+                                            elapsed,
+                                            name
+                                        );
+                                        cx.shared.align_target.lock(|a| *a = target);
+                                    }
                                 },
                             );
                         }

@@ -298,13 +298,17 @@ impl Default for LoadAction {
 
 /// One breakpoint. `interp` describes the segment from THIS point to the next
 /// (ignored on the final point — the tail is governed by EndBehavior).
-/// `load_action` fires once when elapsed time crosses this point's `t_ms`.
+/// `load_action` and `align_phase` fire once when elapsed time crosses this
+/// point's `t_ms`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProfilePoint {
     pub t_ms: u32,
     pub target_rpm: f32,
     pub interp: SegmentInterp,
     pub load_action: LoadAction,
+    /// Switch the PLL's alignment target to this phase at this point.
+    /// None = leave the current selection alone.
+    pub align_phase: Option<AlignPhase>,
 }
 
 impl Default for ProfilePoint {
@@ -314,6 +318,7 @@ impl Default for ProfilePoint {
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         }
     }
 }
@@ -409,20 +414,20 @@ pub fn profile_finished(profile: &SetpointProfile, elapsed_ms: u32) -> bool {
     profile.count > 0 && profile.end_behavior == EndBehavior::Stop && elapsed_ms >= profile.total_ms
 }
 
-/// Fire the `load_action` of every breakpoint the profile clock crossed this
-/// tick, in time order, via `fire`. A point fires when the timeline passes its
-/// `t_ms`: `prev < t_ms <= now`. On the first tick of a run (`prev_ms == None`)
-/// every point with `t_ms <= now` fires, so a t=0 action applies immediately.
+/// Visit every breakpoint the profile clock crossed this tick, in time order.
+/// A point is crossed when the timeline passes its `t_ms`: `prev < t_ms <= now`.
+/// On the first tick of a run (`prev_ms == None`) every point with
+/// `t_ms <= now` counts, so t=0 actions apply immediately.
 ///
-/// EndBehavior::Loop re-fires actions every lap (the last point fires as the lap
-/// ends, the first as the next begins); HoldLast/Stop fire each point once.
+/// EndBehavior::Loop re-visits points every lap (the last point as the lap
+/// ends, the first as the next begins); HoldLast/Stop visit each point once.
 /// Pure — the caller owns `prev_ms` (the previous tick's elapsed time).
 /// Assumes a tick is shorter than one lap (10 ms tick vs a multi-second profile).
-pub fn for_each_load_action<F: FnMut(LoadAction)>(
+pub fn for_each_crossed_point<F: FnMut(&ProfilePoint)>(
     profile: &SetpointProfile,
     prev_ms: Option<u32>,
     now_ms: u32,
-    mut fire: F,
+    mut visit: F,
 ) {
     let n = profile.count as usize;
     if n == 0 {
@@ -432,41 +437,68 @@ pub fn for_each_load_action<F: FnMut(LoadAction)>(
 
     let looping = profile.end_behavior == EndBehavior::Loop && profile.total_ms > 0;
     if !looping {
-        fire_window(pts, prev_ms, now_ms, &mut fire);
+        crossed_window(pts, prev_ms, now_ms, &mut visit);
         return;
     }
 
     let total = profile.total_ms;
     let (now_lap, now_local) = (now_ms / total, now_ms % total);
     match prev_ms {
-        None => fire_window(pts, None, now_local, &mut fire),
+        None => crossed_window(pts, None, now_local, &mut visit),
         Some(prev) => {
             let (prev_lap, prev_local) = (prev / total, prev % total);
             if now_lap == prev_lap {
-                fire_window(pts, Some(prev_local), now_local, &mut fire);
+                crossed_window(pts, Some(prev_local), now_local, &mut visit);
             } else {
                 // Crossed a lap boundary: finish the old lap, then start the new one.
-                fire_window(pts, Some(prev_local), total, &mut fire);
-                fire_window(pts, None, now_local, &mut fire);
+                crossed_window(pts, Some(prev_local), total, &mut visit);
+                crossed_window(pts, None, now_local, &mut visit);
             }
         }
     }
 }
 
-/// Fire every non-None action with `lo_excl < t_ms <= hi_incl` (no lower bound
-/// when `lo_excl` is None). Points are sorted, so actions fire in time order.
-fn fire_window<F: FnMut(LoadAction)>(
+/// Visit every point with `lo_excl < t_ms <= hi_incl` (no lower bound when
+/// `lo_excl` is None). Points are sorted, so visits happen in time order.
+fn crossed_window<F: FnMut(&ProfilePoint)>(
     pts: &[ProfilePoint],
     lo_excl: Option<u32>,
     hi_incl: u32,
-    fire: &mut F,
+    visit: &mut F,
 ) {
     for p in pts {
-        let past_lo = lo_excl.map_or(true, |lo| p.t_ms > lo);
-        if past_lo && p.t_ms <= hi_incl && p.load_action != LoadAction::None {
-            fire(p.load_action);
+        if lo_excl.map_or(true, |lo| p.t_ms > lo) && p.t_ms <= hi_incl {
+            visit(p);
         }
     }
+}
+
+/// The non-None `load_action`s of the points crossed this tick, in order.
+pub fn for_each_load_action<F: FnMut(LoadAction)>(
+    profile: &SetpointProfile,
+    prev_ms: Option<u32>,
+    now_ms: u32,
+    mut fire: F,
+) {
+    for_each_crossed_point(profile, prev_ms, now_ms, |p| {
+        if p.load_action != LoadAction::None {
+            fire(p.load_action);
+        }
+    });
+}
+
+/// The `align_phase` switches of the points crossed this tick, in order.
+pub fn for_each_align_action<F: FnMut(AlignPhase)>(
+    profile: &SetpointProfile,
+    prev_ms: Option<u32>,
+    now_ms: u32,
+    mut fire: F,
+) {
+    for_each_crossed_point(profile, prev_ms, now_ms, |p| {
+        if let Some(ph) = p.align_phase {
+            fire(ph);
+        }
+    });
 }
 
 /// Compiled-in demo profile: ramp 0→1500 over 5s, hold 1500 for 20s, ramp
@@ -479,30 +511,35 @@ pub const DEFAULT_PROFILE: SetpointProfile = SetpointProfile {
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         }; MAX_PROFILE_POINTS];
         p[0] = ProfilePoint {
             t_ms: 0,
             target_rpm: 0.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         };
         p[1] = ProfilePoint {
             t_ms: 5000,
             target_rpm: 1500.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         };
         p[2] = ProfilePoint {
             t_ms: 25000,
             target_rpm: 1500.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         };
         p[3] = ProfilePoint {
             t_ms: 30000,
             target_rpm: 1800.0,
             interp: SegmentInterp::Linear,
             load_action: LoadAction::None,
+            align_phase: None,
         };
         p
     },
