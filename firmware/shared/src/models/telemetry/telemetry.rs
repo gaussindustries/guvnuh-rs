@@ -409,6 +409,66 @@ pub fn profile_finished(profile: &SetpointProfile, elapsed_ms: u32) -> bool {
     profile.count > 0 && profile.end_behavior == EndBehavior::Stop && elapsed_ms >= profile.total_ms
 }
 
+/// Fire the `load_action` of every breakpoint the profile clock crossed this
+/// tick, in time order, via `fire`. A point fires when the timeline passes its
+/// `t_ms`: `prev < t_ms <= now`. On the first tick of a run (`prev_ms == None`)
+/// every point with `t_ms <= now` fires, so a t=0 action applies immediately.
+///
+/// EndBehavior::Loop re-fires actions every lap (the last point fires as the lap
+/// ends, the first as the next begins); HoldLast/Stop fire each point once.
+/// Pure — the caller owns `prev_ms` (the previous tick's elapsed time).
+/// Assumes a tick is shorter than one lap (10 ms tick vs a multi-second profile).
+pub fn for_each_load_action<F: FnMut(LoadAction)>(
+    profile: &SetpointProfile,
+    prev_ms: Option<u32>,
+    now_ms: u32,
+    mut fire: F,
+) {
+    let n = profile.count as usize;
+    if n == 0 {
+        return;
+    }
+    let pts = &profile.points[..n];
+
+    let looping = profile.end_behavior == EndBehavior::Loop && profile.total_ms > 0;
+    if !looping {
+        fire_window(pts, prev_ms, now_ms, &mut fire);
+        return;
+    }
+
+    let total = profile.total_ms;
+    let (now_lap, now_local) = (now_ms / total, now_ms % total);
+    match prev_ms {
+        None => fire_window(pts, None, now_local, &mut fire),
+        Some(prev) => {
+            let (prev_lap, prev_local) = (prev / total, prev % total);
+            if now_lap == prev_lap {
+                fire_window(pts, Some(prev_local), now_local, &mut fire);
+            } else {
+                // Crossed a lap boundary: finish the old lap, then start the new one.
+                fire_window(pts, Some(prev_local), total, &mut fire);
+                fire_window(pts, None, now_local, &mut fire);
+            }
+        }
+    }
+}
+
+/// Fire every non-None action with `lo_excl < t_ms <= hi_incl` (no lower bound
+/// when `lo_excl` is None). Points are sorted, so actions fire in time order.
+fn fire_window<F: FnMut(LoadAction)>(
+    pts: &[ProfilePoint],
+    lo_excl: Option<u32>,
+    hi_incl: u32,
+    fire: &mut F,
+) {
+    for p in pts {
+        let past_lo = lo_excl.map_or(true, |lo| p.t_ms > lo);
+        if past_lo && p.t_ms <= hi_incl && p.load_action != LoadAction::None {
+            fire(p.load_action);
+        }
+    }
+}
+
 /// Compiled-in demo profile: ramp 0→1500 over 5s, hold 1500 for 20s, ramp
 /// 1500→1800 over 5s, hold 1800 (the 60 Hz target) indefinitely. Runs when no
 /// profile is loaded. Tune on hardware.

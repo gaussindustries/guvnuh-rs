@@ -211,6 +211,9 @@ mod app {
         pid: crate::guv::pid::PidController,
         ramp: Option<crate::guv::ramp::Ramp>,
         run_elapsed_ms: u32,
+        /// Profile clock value on the previous SPOOLUP tick — edge-detects which
+        /// breakpoints were crossed so each load_action fires exactly once.
+        profile_prev_ms: Option<u32>,
         calibrator: Option<crate::guv::calibrate::Calibrator>,
         boot_hello_attempts: u32,
         adc_drdy: crate::guv::adc::Drdy,
@@ -285,6 +288,7 @@ mod app {
                 pid: crate::guv::pid::PidController::new(PidGains::default()),
                 ramp: None,
                 run_elapsed_ms: 0,
+                profile_prev_ms: None,
                 calibrator: None,
                 boot_hello_attempts: 0,
                 last_p_total: 0.0,
@@ -449,7 +453,7 @@ mod app {
         shared = [state, ld1, ld2, ld3, relay, load_bank, motor, tx, rx, run_config,
             current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile,
             wcet, adc_acc,adc_meas, align_target],
-        local = [safety_init_done, pid, ramp, run_elapsed_ms, calibrator, boot_hello_attempts]
+        local = [safety_init_done, pid, ramp, run_elapsed_ms, profile_prev_ms, calibrator, boot_hello_attempts]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
         let dt_ms: u32 = 10;
@@ -886,6 +890,50 @@ mod app {
                     // directly (its own first segment handles ramp-in), and we
                     // skip the classic ramp entirely for closed-loop modes.
                     let has_profile = cx.shared.active_profile.lock(|ap| ap.is_some());
+
+                    // ── Profile-scheduled load steps ──
+                    // Fire each breakpoint's load_action once, as the profile clock
+                    // crosses it — same clock and same modes that drive the RPM
+                    // target below. The LoadBank still enforces the ordered path.
+                    if has_profile && matches!(config.mode, RunMode::ClosedLoop | RunMode::Generate)
+                    {
+                        // run_elapsed_ms strictly increases within a run; if it
+                        // didn't, the clock was reset for a new run → first tick.
+                        let prev = match *cx.local.profile_prev_ms {
+                            Some(p) if p < elapsed => Some(p),
+                            _ => None,
+                        };
+                        let profile = cx.shared.active_profile.lock(|ap| *ap);
+                        if let Some(p) = profile {
+                            shared::models::telemetry::telemetry::for_each_load_action(
+                                &p,
+                                prev,
+                                elapsed,
+                                |act| {
+                                    use crate::guv::load_bank::LoadLevel as LL;
+                                    use shared::models::telemetry::telemetry::LoadAction as LA;
+                                    let name = match act {
+                                        LA::None => "None",
+                                        LA::HalfLoad => "HalfLoad",
+                                        LA::FullLoad => "FullLoad",
+                                        LA::StepDown => "StepDown",
+                                        LA::ShedAll => "ShedAll",
+                                    };
+                                    defmt::info!("Profile t={}ms → load {=str}", elapsed, name);
+                                    cx.shared.load_bank.lock(|lb| match act {
+                                        LA::None => {}
+                                        LA::HalfLoad => lb.set_level(LL::One),
+                                        LA::FullLoad => lb.set_level(LL::Both),
+                                        LA::StepDown => lb.step_down(),
+                                        LA::ShedAll => lb.set_level(LL::None),
+                                    });
+                                },
+                            );
+                        }
+                        *cx.local.profile_prev_ms = Some(elapsed);
+                    } else {
+                        *cx.local.profile_prev_ms = None;
+                    }
 
                     // Ramp up (classic ramp — used when NO profile, or for the
                     // open-loop / generate spool)
