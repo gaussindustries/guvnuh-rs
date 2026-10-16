@@ -575,9 +575,14 @@ mod app {
                         }
                     });
 
-                    // Did a HelloAck land in the command queue? (ISR decoded it.)
-                    // Drain it out; leave any other queued commands intact.
-                    let acked = cx.shared.cmd_in.lock(|q| {
+                    // Did a HelloAck arrive? The loop top already popped ONE
+                    // command into `received_cmd` this tick — check that first,
+                    // or an ack that arrives once per tick is always stolen and
+                    // the handshake only ever "succeeds" via the 1 s timeout.
+                    // Then drain any further HelloAcks still queued; leave other
+                    // queued commands intact.
+                    let popped_ack = matches!(received_cmd, Some(Command::HelloAck));
+                    let queued_ack = cx.shared.cmd_in.lock(|q| {
                         let mut found = false;
                         let mut keep: heapless::Deque<Command, 8> = heapless::Deque::new();
                         while let Some(c) = q.pop_front() {
@@ -590,6 +595,7 @@ mod app {
                         *q = keep;
                         found
                     });
+                    let acked = popped_ack || queued_ack;
 
                     if acked {
                         defmt::info!("HelloAck received — entering IDLE");
@@ -1605,19 +1611,17 @@ mod app {
     // ─────────────────────────────────────────────────────────────────────────────
     // C) DRDY ISR — fires at ADC_SAMPLE_RATE (~4kHz). Lean: read frame, accumulate.
     //    Priority 3 (above 500Hz supervise=2, 100Hz control=1) — a missed sample
-    //    corrupts RMS, but this is tiny. Uses a spare EXTI line binding for PD10.
+    //    corrupts RMS, but this is tiny. DRDY is PD5 → EXTI line 5 → EXTI9_5.
+    //    Pending bit is cleared FIRST so a DRDY edge that lands during the read
+    //    re-pends the IRQ instead of being lost.
     // ─────────────────────────────────────────────────────────────────────────────
-
-    // #[task(binds = EXTI15_10, priority = 3, shared = [adc, adc_acc], local = [adc_drdy])]
-    // fn adc_drdy_isr(mut cx: adc_drdy_isr::Context) {
-    //     if crate::guv::adc::ADC_HARDWARE_ENABLED {
-    //         cx.shared.adc.lock(|adc| {
-    //             let frame = adc.read_frame();
-    //             cx.shared.adc_acc.lock(|acc| acc.add(&frame));
-    //         });
-    //     }
-    //     cx.local.adc_drdy.clear_interrupt_pending_bit();
-    // }
+    #[task(binds = EXTI9_5, priority = 3, shared = [adc, adc_acc], local = [adc_drdy])]
+    fn adc_drdy_isr(mut cx: adc_drdy_isr::Context) {
+        cx.local.adc_drdy.clear_interrupt_pending_bit();
+        if let Some(frame) = cx.shared.adc.lock(|adc| adc.read_frame()) {
+            cx.shared.adc_acc.lock(|acc| acc.add(&frame));
+        }
+    }
     // FUTURE — do not add until ADS131M04 is wired
     // #[task(priority = 1, shared = [encoder, measurements], local = [/* adc handle, sample buffer */])]
     // async fn measurement(mut cx: measurement::Context) {

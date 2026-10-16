@@ -62,11 +62,26 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
 
     defmt::info!("BOOT: freezing RCC");
     // Modify this block in your setup function:
+    // SPI1's kernel clock is PLL1_Q. sys_ck = 64 MHz comes straight from HSI, so
+    // the HAL (0.16) would otherwise never switch PLL1 ON — it only does that
+    // when PLL1_P is in use — while still REPORTING pll1_q_ck = 64 MHz. Result:
+    // a dead SPI kernel clock and an SPI that never shifts a bit. Requesting
+    // pll1_p_ck makes the HAL start PLL1; sys_ck stays on HSI (P runs unused).
     let ccdr = rcc
         .sys_ck(64.MHz())
+        .pll1_p_ck(64.MHz())
         .pll1_q_ck(64.MHz())
         // Ensure peripheral management is fully passed in
         .freeze(pwrcfg, &dp.SYSCFG);
+
+    // Ask the hardware, not the HAL's bookkeeping: is PLL1 actually locked?
+    // SAFETY: read-only RCC register access.
+    let pll1_locked = unsafe { (*pac::RCC::ptr()).cr.read().pll1rdy().is_ready() };
+    if pll1_locked {
+        defmt::info!("BOOT: PLL1 locked (SPI1 kernel clock live)");
+    } else {
+        defmt::error!("BOOT: PLL1 NOT locked — SPI1 has no kernel clock; ADC SPI will stall");
+    }
 
     //DELETE THIS AFTER TEST
     let pll1_q = ccdr.clocks.pll1_q_ck().map(|rate| rate.raw()).unwrap_or(0); // Uses 0 if the clock is disabled
@@ -123,15 +138,20 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     defmt::info!("BOOT: encoder configured");
 
     let sck = gpioa.pa5.into_alternate::<5>();
-    let miso = gpioa.pa6.into_alternate::<5>();
-    let mosi = gpioa.pa7.into_alternate::<5>();
+    // Pull-up on MISO: if no ADC drives DOUT, reads come back 0xFFFF (clearly
+    // "nothing there") instead of a floating pin that tends to read 0x0000.
+    let miso = gpioa.pa6.into_alternate::<5>().internal_pull_up(true);
+    // MOSI on PB5 = Nucleo-144 Arduino D11. On this board PA7 is wired to the
+    // on-board Ethernet PHY (RMII CRS_DV), which drives it — unusable for SPI.
+    let mosi = gpiob.pb5.into_alternate::<5>();
     defmt::info!("BOOT: ADC pins configured");
-    // CS1=PD8, CS2=PD9, DRDY=PD10(EXTI in), SYNC=PD11, RST=PD12
+    // CS1=PD3, CS2=PD4, DRDY=PD5 (EXTI9_5), SYNC/RESET=PD6 (both chips), PD7 unused
     // ─────────────────────────────────────────────────────────────────────────────
     let mut adc_cs1 = gpiod.pd3.into_push_pull_output();
     let mut adc_cs2 = gpiod.pd4.into_push_pull_output();
     adc_cs1.set_high(); // CS idle high (active low)
     adc_cs2.set_high();
+    // Starts LOW → both ADS131M04s held in reset until Ads131Pair::new() releases them.
     let adc_sync = gpiod.pd6.into_push_pull_output();
     let adc_rst = gpiod.pd7.into_push_pull_output();
 
@@ -146,7 +166,7 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     if crate::guv::adc::ADC_HARDWARE_ENABLED {
         adc_drdy.enable_interrupt(&mut dp.EXTI); // only arm when hardware present
     }
-    //     // PD10 → EXTI15_10 line; the ISR in main binds EXTI15_10.
+    // PD5 → EXTI line 5 → EXTI9_5; the DRDY ISR in main binds EXTI9_5.
     defmt::info!("BOOT: DRDY EXTI configured");
     let adc_spi = dp.SPI1.spi(
         (sck, miso, mosi),
