@@ -1,0 +1,62 @@
+** Drc report for master_sense_buses.kicad_pcb **
+** Created on 2026-10-16T22:13:12 **
+** Report includes: Errors **
+
+** Found 11 DRC violations **
+[starved_thermal]: Thermal relief connection to zone incomplete (layer B.Cu; zone min spoke count 2; actual 1)
+    Local override; error
+    @(124.0000 mm, 98.0000 mm): Zone [GND] on B.Cu and In1.Cu, priority 0
+    @(143.1750 mm, 137.4000 mm): Pad 2 [GND] of C40 on B.Cu
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(151.5500 mm, 88.6000 mm): Footprint C22
+    @(148.6822 mm, 93.8455 mm): Footprint U6
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(152.7324 mm, 99.2000 mm): Footprint C16
+    @(156.7793 mm, 93.8323 mm): Footprint U7
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(152.7324 mm, 99.2000 mm): Footprint C16
+    @(148.6822 mm, 93.8455 mm): Footprint U6
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(151.0000 mm, 148.6000 mm): Footprint C33
+    @(151.6000 mm, 150.4000 mm): Footprint L6
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(151.0000 mm, 148.6000 mm): Footprint C33
+    @(153.2450 mm, 142.0941 mm): Footprint U12
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(151.0000 mm, 152.2000 mm): Footprint C34
+    @(151.6000 mm, 150.4000 mm): Footprint L6
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(142.9200 mm, 100.4000 mm): Footprint C36
+    @(140.2029 mm, 94.1012 mm): Footprint U13
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(143.0000 mm, 84.0000 mm): Footprint C38
+    @(142.4000 mm, 85.8000 mm): Footprint L4
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(142.8800 mm, 87.6000 mm): Footprint C37
+    @(140.2029 mm, 94.1012 mm): Footprint U13
+[courtyards_overlap]: Courtyards overlap
+    Rule: board setup constraints courtyard; error
+    @(142.8800 mm, 87.6000 mm): Footprint C37
+    @(142.4000 mm, 85.8000 mm): Footprint L4
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **
