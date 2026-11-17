@@ -82,18 +82,68 @@ fn enable_cycle_counter(dcb: &mut DCB, dwt: &mut DWT) {
 
 // ── Safety limits (compiled-in; the server may only TUNE within these bounds) ──
 
-pub const LOAD_REJECT_DROP_A: f32 = 2.0; // A drop in DC-bus current between 500Hz ticks = rejection
-pub const LOAD_REJECT_MIN_A: f32 = 1.0; // only arm the detector above this DC-bus current
-pub const DC_OVERVOLT_LIMIT: f32 = 300.0; // V — DC bus ceiling (tune to your rectifier)
-pub const DC_OVERCURRENT_LIMIT: f32 = 20.0; // A — DC bus current ceiling
+/// Load rejection = the DC-bus current (2 ms mean) falls this far (A) below
+/// its ~20 ms running baseline. One 2.2 kΩ step at 310 V is ~0.14 A, so this
+/// is half a step.
+pub const LOAD_REJECT_DROP_A: f32 = 0.07;
+/// Only arm the detector while at least this much load current flows (A).
+pub const LOAD_REJECT_MIN_A: f32 = 0.10;
+/// Baseline smoothing per 2 ms supervisor tick (~20 ms time constant).
+pub const LOAD_REJECT_BASELINE_ALPHA: f32 = 0.1;
+/// DC bus ceiling (V). Normal bus is 310–325 V at 230 V line-to-line; the
+/// DC channel reads up to ~405 V.
+pub const DC_OVERVOLT_LIMIT: f32 = 380.0;
+/// DC bus current ceiling (A). Reachable only with R40 = 0.05 Ω (~0.59 A full
+/// scale); with the 0.1 Ω part the channel clips at ~0.29 A (boot log warns).
+pub const DC_OVERCURRENT_LIMIT: f32 = 0.45;
 /// Active from boot with zero config — the autonomous-mode ceiling.
-pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2800.0;
+/// 2200 rpm ≈ 1.2× the SEIG's ~1850 rpm for 60 Hz.
+pub const OVERSPEED_LIMIT_DEFAULT: f32 = 2200.0;
 /// Absolute bounds any server-commanded limit is clamped to. The server can
 /// never disable protection nor set an instant-trip value.
 pub const OVERSPEED_LIMIT_MIN: f32 = 500.0;
 pub const OVERSPEED_LIMIT_MAX: f32 = 3000.0; // ← true mechanical never-exceed
 /// RPM readings outside this window (or non-finite) mean the sensor is lying.
 pub const RPM_PLAUSIBLE_MAX: f32 = 4000.0;
+/// Turning backwards faster than this (rpm) trips SensorOutOfRange. A reversed
+/// motor or encoder would otherwise make the speed loop run away.
+pub const REVERSE_RPM_TRIP: f32 = 200.0;
+/// Encoder sign: forward rotation must read POSITIVE rpm. Flip this (not the
+/// motor leads) if the shaft has to turn one particular way.
+pub const ENCODER_SIGN: f32 = -1.0;
+/// Independent watchdog timeout (ms). The 500 Hz supervisor feeds it. A hang,
+/// panic or HardFault stops the feeding and resets the MCU, which drops the
+/// relay (PE0) and the PWM pin (pull-down) — a crash lands on stopped.
+pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
+
+// ── LOAD_REJECTION recovery (10 ms control ticks) ──
+/// Minimum time spent in LOAD_REJECTION (ticks).
+pub const LR_MIN_TICKS: u32 = 20;
+/// Speed must stay within ±2% of target this long to count as recovered.
+pub const LR_SETTLE_TICKS: u32 = 30;
+/// Give up waiting for ±2% and return to the previous state after this.
+pub const LR_TIMEOUT_TICKS: u32 = 500;
+
+/// A sudden drop in DC-bus current seen by the supervisor. The state machine
+/// decides what to do with it (LOAD_REJECTION in READY/GENERATE).
+#[derive(Clone, Copy)]
+pub struct LoadRejectEvent {
+    pub i_before: f32,
+    pub i_after: f32,
+}
+
+/// Feedforward (from calibration) plus PID trim, clamped to 0..1. Every state
+/// that holds speed uses this, so hand-offs between them are bumpless.
+pub fn speed_hold(
+    cal: Option<crate::guv::calibrate::CalResult>,
+    pid: &mut crate::guv::pid::PidController,
+    target_rpm: f32,
+    measured_rpm: f32,
+    dt_s: f32,
+) -> f32 {
+    let ff = cal.and_then(|c| c.feedforward(target_rpm)).unwrap_or(0.0);
+    (ff + pid.update(target_rpm, measured_rpm, dt_s)).clamp(0.0, 1.0)
+}
 
 // ── Deadline monitoring (execution-time budget per control iteration) ──
 
@@ -186,6 +236,9 @@ mod app {
         pub cmd_in: heapless::Deque<Command, 8>,
         pub align_target: crate::guv::adc::AlignPhase,
         pub measurements: crate::models::measurements::Measurements,
+        /// Set by the supervisor on a sudden DC-bus current drop; taken by
+        /// state_manager.
+        pub load_reject: Option<crate::LoadRejectEvent>,
 
         pub calibration: Option<crate::guv::calibrate::CalResult>,
         pub pending_report: Option<shared::models::telemetry::telemetry::CalibrationReport>,
@@ -219,8 +272,18 @@ mod app {
         calibrator: Option<crate::guv::calibrate::Calibrator>,
         boot_hello_attempts: u32,
         adc_drdy: crate::guv::adc::Drdy,
-        last_p_total: f32,
+        /// Supervisor: running DC-bus current baseline (A) for load rejection.
+        i_base: f32,
+        i_base_ok: bool,
+        /// Supervisor: ticks before another load-rejection event may fire.
+        lr_holdoff: u32,
         estop: gpio::Pin<'E', 6, Input>,
+        /// Supervisor: independent watchdog, fed every 2 ms.
+        wdg: stm32h7xx_hal::independent_watchdog::IndependentWatchdog,
+        /// state_manager: LOAD_REJECTION bookkeeping.
+        lr_ticks: u32,
+        lr_settled: u32,
+        lr_from: STATE,
     }
 
     #[init]
@@ -249,6 +312,15 @@ mod app {
 
         defmt::info!("INIT: Ads131Pair::new() complete");
         let load_bank = crate::guv::load_bank::LoadBank::new(board.load_step_1, board.load_step_2);
+
+        if crate::DC_OVERCURRENT_LIMIT >= crate::guv::adc::I_DC_FULL_SCALE {
+            defmt::warn!(
+                "DC over-current trip ({} mA) is above the current channel's full scale ({} mA) with R40 = {} mOhm, so it cannot fire. Fit the 0.05 Ohm shunt and set SHUNT_OHMS in adc.rs.",
+                (crate::DC_OVERCURRENT_LIMIT * 1000.0) as i32,
+                (crate::guv::adc::I_DC_FULL_SCALE * 1000.0) as i32,
+                (crate::guv::adc::SHUNT_OHMS * 1000.0) as i32
+            );
+        }
         state_manager::spawn().ok();
         telemetry_task::spawn().ok();
         safety_supervisor::spawn().ok();
@@ -256,6 +328,12 @@ mod app {
         cx.core.DCB.enable_trace();
         cx.core.DWT.enable_cycle_counter();
         board.ld3.set_high(); // Red = booting
+
+        // Start the watchdog last: the ADC bring-up above can take a while.
+        // From here the supervisor must feed it every 2 ms.
+        let mut wdg = board.iwdg;
+        wdg.start(crate::WATCHDOG_TIMEOUT_MS.millis());
+        defmt::info!("INIT: watchdog armed ({} ms)", crate::WATCHDOG_TIMEOUT_MS);
         (
             Shared {
                 state: STATE::BOOT,
@@ -282,6 +360,7 @@ mod app {
                 adc_acc: crate::guv::adc::Accumulator::default(),
                 adc_meas: crate::guv::adc::Measurements::default(),
                 align_target: crate::guv::adc::AlignPhase::default(),
+                load_reject: None,
             },
             Local {
                 safety_init_done: false,
@@ -293,9 +372,15 @@ mod app {
                 profile_prev_ms: None,
                 calibrator: None,
                 boot_hello_attempts: 0,
-                last_p_total: 0.0,
+                i_base: 0.0,
+                i_base_ok: false,
+                lr_holdoff: 0,
                 adc_drdy: board.adc_drdy,
                 estop: board.estop,
+                wdg,
+                lr_ticks: 0,
+                lr_settled: 0,
+                lr_from: STATE::GENERATE,
             },
         )
     }
@@ -308,13 +393,17 @@ mod app {
     // ────────────────────────────────────────────
     #[task(priority = 2,
         shared = [current_rpm, overspeed_limit, motor, relay,
-            state, last_fault, ld3, ld2, ld1, adc_acc, load_bank] ,
-        local = [last_p_total,estop])]
+            state, last_fault, ld3, ld2, ld1, adc_acc, load_bank, load_reject],
+        local = [i_base, i_base_ok, lr_holdoff, estop, wdg])]
     async fn safety_supervisor(mut cx: safety_supervisor::Context) {
         const SUPERVISE_MS: u32 = 2; // 500 Hz
 
         loop {
             Mono::delay(SUPERVISE_MS.millis()).await;
+
+            // Proof of life. If this task stops running (hang, panic,
+            // HardFault, interrupt storm) the IWDG resets the MCU.
+            cx.local.wdg.feed();
 
             // ── PHYSICAL E-STOP — highest priority, fail-safe ──
             // Pin HIGH = E-stop (button pressed OR wire broken). LOW = closed/running.
@@ -346,10 +435,13 @@ mod app {
             let limit = cx.shared.overspeed_limit.lock(|l| *l);
 
             // ── evaluate LOCAL trip conditions (no comms involved) ──
+            // Overspeed on |rpm|: a reversed encoder or motor must not blind it.
             let trip: Option<Fault> = if !rpm.is_finite() || rpm.abs() > crate::RPM_PLAUSIBLE_MAX {
                 Some(Fault::SensorOutOfRange)
-            } else if rpm > limit {
+            } else if rpm.abs() > limit {
                 Some(Fault::Overspeed)
+            } else if rpm < -crate::REVERSE_RPM_TRIP {
+                Some(Fault::SensorOutOfRange)
             } else {
                 None
             };
@@ -370,11 +462,17 @@ mod app {
                     cx.shared.state.lock(|s| *s = STATE::FAULT);
                     cx.shared.ld3.lock(|l| l.set_high());
 
-                    if rpm > limit && rpm.is_finite() {
+                    if rpm.is_finite() && rpm.abs() > limit && rpm.abs() <= crate::RPM_PLAUSIBLE_MAX
+                    {
                         defmt::error!(
                             "!! OVERSPEED TRIP !! rpm={} limit={}",
                             rpm as i32,
                             limit as i32
+                        );
+                    } else if rpm.is_finite() && rpm < -crate::REVERSE_RPM_TRIP {
+                        defmt::error!(
+                            "!! REVERSE ROTATION !! rpm={} — swap A+/A- or flip ENCODER_SIGN",
+                            rpm as i32
                         );
                     } else {
                         defmt::error!("!! SENSOR TRIP !! implausible rpm={}", rpm as i32);
@@ -383,42 +481,46 @@ mod app {
                 // Keep forcing off every cycle while faulted — the supervisor
                 // doesn't rely on state_manager running to hold safe.
             }
-            // ── ADC-based fast protection (runs every 500Hz tick) ──
-            let prot = cx
-                .shared
-                .adc_acc
-                .lock(|acc| crate::guv::adc::finalize_protection(acc, 1.0));
+            // ── ADC-based fast protection: DC-bus means over the last 2 ms ──
+            // None = no samples (ADC offline / not converting): skip, never
+            // act on zeros.
+            let fast = cx.shared.adc_acc.lock(|acc| acc.take_fast_dc(1.0));
+            let Some(prot) = fast else {
+                continue;
+            };
 
-            // LOAD REJECTION: a sudden DC-bus CURRENT drop → generator unloaded →
-            // overspeed hazard (critical for a turbine). React LOCALLY, now.
-            // (Power isn't computed on-device anymore; rectifier current is the
-            //  load proxy — a big i_dc drop = load rejected. Same feedforward source.)
-            let last_i = *cx.local.last_p_total; // repurposed: last DC-bus current (A)
-            let i_drop = last_i - prot.i_dc;
-            if last_i > crate::LOAD_REJECT_MIN_A && i_drop > crate::LOAD_REJECT_DROP_A {
-                let already_faulted = cx
-                    .shared
-                    .state
-                    .lock(|s| matches!(*s, STATE::FAULT | STATE::ESTOP));
-                if !already_faulted {
-                    defmt::warn!(
-                        "!! LOAD REJECTION !! i_dc {}A -> {}A (drop {}A)",
-                        last_i as i32,
-                        prot.i_dc as i32,
-                        i_drop as i32
-                    );
-                    // shed the bank immediately + go to fault.
-                    cx.shared.load_bank.lock(|lb| lb.emergency_shed());
-                    cx.shared.motor.lock(|m| m.emergency_off());
-                    cx.shared.relay.lock(|r| r.set_low());
-                    cx.shared
-                        .last_fault
-                        .lock(|f| *f = Some(Fault::LoadRejection));
-                    cx.shared.state.lock(|s| *s = STATE::FAULT);
-                    cx.shared.ld3.lock(|l| l.set_high());
-                }
+            // LOAD REJECTION: the DC-bus current drops well below its recent
+            // baseline → the generator just lost load → the shaft will speed
+            // up. That is a control event, not a fault: report it and let the
+            // state machine respond (LOAD_REJECTION in READY/GENERATE). The
+            // overspeed trip above stays the backstop.
+            if !*cx.local.i_base_ok {
+                *cx.local.i_base = prot.i_dc;
+                *cx.local.i_base_ok = true;
             }
-            *cx.local.last_p_total = prot.i_dc;
+            let base = *cx.local.i_base;
+            if *cx.local.lr_holdoff > 0 {
+                *cx.local.lr_holdoff -= 1;
+            }
+            let dropped =
+                base > crate::LOAD_REJECT_MIN_A && base - prot.i_dc > crate::LOAD_REJECT_DROP_A;
+            if dropped && *cx.local.lr_holdoff == 0 {
+                defmt::warn!(
+                    "!! LOAD REJECTION !! i_dc {} mA -> {} mA",
+                    (base * 1000.0) as i32,
+                    (prot.i_dc * 1000.0) as i32
+                );
+                cx.shared.load_reject.lock(|e| {
+                    *e = Some(crate::LoadRejectEvent {
+                        i_before: base,
+                        i_after: prot.i_dc,
+                    })
+                });
+                *cx.local.i_base = prot.i_dc; // re-baseline at the new load
+                *cx.local.lr_holdoff = 50; // 100 ms before another event
+            } else {
+                *cx.local.i_base = base + (prot.i_dc - base) * crate::LOAD_REJECT_BASELINE_ALPHA;
+            }
 
             // fast DC-bus electrical trips (local, no comms):
             if prot.v_dc > crate::DC_OVERVOLT_LIMIT || prot.i_dc > crate::DC_OVERCURRENT_LIMIT {
@@ -454,8 +556,9 @@ mod app {
     #[task(priority = 1,
         shared = [state, ld1, ld2, ld3, relay, load_bank, motor, tx, rx, run_config,
             current_rpm, last_fault, cmd_in, calibration, pending_report, active_profile,
-            wcet, adc_acc,adc_meas, align_target],
-        local = [safety_init_done, pid, ramp, run_elapsed_ms, profile_prev_ms, calibrator, boot_hello_attempts]
+            wcet, adc_acc, adc_meas, align_target, load_reject],
+        local = [safety_init_done, pid, ramp, run_elapsed_ms, profile_prev_ms, calibrator, boot_hello_attempts,
+            lr_ticks, lr_settled, lr_from]
     )]
     async fn state_manager(mut cx: state_manager::Context) {
         let dt_ms: u32 = 10;
@@ -541,13 +644,53 @@ mod app {
 
             let _wcet_timer = CycleTimer::start();
             let align = cx.shared.align_target.lock(|a| *a);
-            // ── ADC full finalize: compute all scalars, store, reset the window ──
-            let adc_m = cx.shared.adc_acc.lock(|acc| {
-                let m = crate::guv::adc::finalize_full(acc, 1.0, align);
-                acc.reset(); // this task OWNS the reset (500Hz only reads partials)
-                m
+            // ── ADC: fold in the latest completed 100 ms AC window (if one
+            // closed since last tick) and the DC means of the last 10 ms ──
+            let (win, dc) = cx
+                .shared
+                .adc_acc
+                .lock(|acc| (acc.take_window(), acc.take_control_dc(1.0)));
+            cx.shared.adc_meas.lock(|am| {
+                if let Some(w) = win {
+                    crate::guv::adc::finalize_window(&w, 1.0, am);
+                }
+                if let Some(d) = dc {
+                    am.apply_dc(&d);
+                }
+                am.select(align);
             });
-            cx.shared.adc_meas.lock(|am| *am = adc_m);
+
+            // ── Load rejection reported by the supervisor ──
+            if let Some(ev) = cx.shared.load_reject.lock(|e| e.take()) {
+                // Only READY/GENERATE get the recovery state; the conditional
+                // write never overrides a FAULT/ESTOP the supervisor just set.
+                let entered = cx.shared.state.lock(|s| {
+                    if matches!(*s, STATE::READY | STATE::GENERATE) {
+                        *s = STATE::LOAD_REJECTION;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if entered {
+                    *cx.local.lr_from = current_state;
+                    *cx.local.lr_ticks = 0;
+                    *cx.local.lr_settled = 0;
+                    defmt::warn!(
+                        "Load rejection {} mA -> {} mA in {=str} -> LOAD_REJECTION",
+                        (ev.i_before * 1000.0) as i32,
+                        (ev.i_after * 1000.0) as i32,
+                        current_state.as_str()
+                    );
+                } else {
+                    defmt::info!(
+                        "Load drop {} mA -> {} mA in {=str}: speed loop absorbs it",
+                        (ev.i_before * 1000.0) as i32,
+                        (ev.i_after * 1000.0) as i32,
+                        current_state.as_str()
+                    );
+                }
+            }
 
             // ── State machine ──
             match current_state {
@@ -1086,7 +1229,20 @@ mod app {
                         continue;
                     }
 
-                    // TODO: monitor v_gen_rms from ADC; advance when voltage builds.
+                    // Hold speed while the caps excite the generator (the
+                    // excitation load would otherwise drag it down open-loop).
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+                    let cal = cx.shared.calibration.lock(|c| *c);
+                    let duty = crate::speed_hold(
+                        cal,
+                        cx.local.pid,
+                        config.target_rpm,
+                        measured,
+                        dt_ms as f32 / 1000.0,
+                    );
+                    cx.shared.motor.lock(|m| m.set_demand(duty));
+
+                    // TODO: monitor v_a_rms from the ADC; advance when voltage builds.
                     // Placeholder: auto-advance after 3 seconds.
                     *cx.local.run_elapsed_ms += dt_ms;
                     if *cx.local.run_elapsed_ms > config.ramp_up_ms + 3000 {
@@ -1109,6 +1265,18 @@ mod app {
                         Mono::delay(dt_ms.millis()).await;
                         continue;
                     }
+
+                    // Hold speed while (eventually) trimming phase.
+                    let measured = cx.shared.current_rpm.lock(|r| *r);
+                    let cal = cx.shared.calibration.lock(|c| *c);
+                    let duty = crate::speed_hold(
+                        cal,
+                        cx.local.pid,
+                        config.target_rpm,
+                        measured,
+                        dt_ms as f32 / 1000.0,
+                    );
+                    cx.shared.motor.lock(|m| m.set_demand(duty));
 
                     // TODO: phase detector + loop filter on theta_err_rad.
                     // Placeholder: auto-advance after 2 seconds past excite.
@@ -1142,10 +1310,12 @@ mod app {
                         continue;
                     }
 
-                    // Maintain PID on RPM to hold speed
+                    // Hold speed: feedforward + PID, same law as SPOOLUP.
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
-                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    let cal = cx.shared.calibration.lock(|c| *c);
+                    let output =
+                        crate::speed_hold(cal, cx.local.pid, config.target_rpm, measured, dt_s);
                     cx.shared.motor.lock(|m| m.set_demand(output));
 
                     // Apply live adjustments
@@ -1211,7 +1381,9 @@ mod app {
 
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
-                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    let cal = cx.shared.calibration.lock(|c| *c);
+                    let output =
+                        crate::speed_hold(cal, cx.local.pid, config.target_rpm, measured, dt_s);
                     cx.shared.motor.lock(|m| m.set_demand(output));
 
                     // Apply live adjustments
@@ -1252,7 +1424,8 @@ mod app {
                         }
                     }
 
-                    // TODO: detect load rejection (large delta in current/RPM)
+                    // Load rejection is detected by the supervisor (DC-bus
+                    // current drop) and routed here at the top of the loop.
 
                     cx.shared.ld1.lock(|l| l.set_high());
                 }
@@ -1272,13 +1445,45 @@ mod app {
 
                     let measured = cx.shared.current_rpm.lock(|r| *r);
                     let dt_s = dt_ms as f32 / 1000.0;
-                    let output = cx.local.pid.update(config.target_rpm, measured, dt_s);
+                    let cal = cx.shared.calibration.lock(|c| *c);
+                    let output =
+                        crate::speed_hold(cal, cx.local.pid, config.target_rpm, measured, dt_s);
                     cx.shared.motor.lock(|m| m.set_demand(output));
 
+                    // Recovered = at least LR_MIN_TICKS in this state AND
+                    // LR_SETTLE_TICKS in a row within ±2% of target. (Checking
+                    // the error alone would exit on the very first tick, before
+                    // the shaft has even started to speed up.)
+                    *cx.local.lr_ticks += 1;
                     let error = (config.target_rpm - measured).abs();
                     if error < config.target_rpm * 0.02 {
-                        defmt::info!("Load rejection recovered → GENERATE");
-                        cx.shared.state.lock(|s| *s = STATE::GENERATE);
+                        *cx.local.lr_settled += 1;
+                    } else {
+                        *cx.local.lr_settled = 0;
+                    }
+                    let back = *cx.local.lr_from;
+                    let settled = *cx.local.lr_ticks >= crate::LR_MIN_TICKS
+                        && *cx.local.lr_settled >= crate::LR_SETTLE_TICKS;
+                    let timed_out = *cx.local.lr_ticks >= crate::LR_TIMEOUT_TICKS;
+                    if settled || timed_out {
+                        if settled {
+                            defmt::info!(
+                                "Load rejection recovered in {} ms -> {=str}",
+                                *cx.local.lr_ticks * dt_ms,
+                                back.as_str()
+                            );
+                        } else {
+                            defmt::warn!(
+                                "Load rejection: not within 2% after {} ms -> {=str} anyway",
+                                *cx.local.lr_ticks * dt_ms,
+                                back.as_str()
+                            );
+                        }
+                        cx.shared.state.lock(|s| {
+                            if *s == STATE::LOAD_REJECTION {
+                                *s = back;
+                            }
+                        });
                     }
 
                     cx.shared.ld1.lock(|l| l.toggle());
@@ -1456,9 +1661,17 @@ mod app {
 
             // drain the calibration outbox (atomic take)
             let report = cx.shared.pending_report.lock(|slot| slot.take());
-            (
+
+            // Values that don't need the supervisor-shared lock, read first.
+            let adc_m = cx.shared.adc_meas.lock(|am| *am);
+            let load_lvl = cx.shared.load_bank.lock(|lb| lb.level());
+
+            // ── 1. Acquire + build the frame. This lock includes resources the
+            // priority-2 supervisor uses (current_rpm, motor, state,
+            // last_fault), so it blocks the supervisor while held: keep it to
+            // a few microseconds — no UART traffic in here. ──
+            let (frame, rpm, demand) = (
                 &mut cx.shared.encoder,
-                &mut cx.shared.tx,
                 &mut cx.shared.state,
                 &mut cx.shared.current_rpm,
                 &mut cx.shared.motor,
@@ -1467,20 +1680,17 @@ mod app {
                 &mut cx.shared.measurements,
             )
                 .lock(
-                    |enc, tx, state, current_rpm, motor, run_config, last_fault, meas| {
+                    |enc, state, current_rpm, motor, run_config, last_fault, meas| {
                         // ── acquisition: encoder → rpm ──
                         let current_count = enc.count();
                         let delta = current_count.wrapping_sub(last_count);
                         last_count = current_count;
                         let counts_per_second = (delta as i32 as f32) * 100.0;
-                        let rpm = (counts_per_second / counts_per_rev) * 60.0 * -1.0;
+                        let rpm = (counts_per_second / counts_per_rev) * 60.0 * crate::ENCODER_SIGN;
 
                         // write into BOTH: control loop reads current_rpm, telemetry reads measurements.
-                        // when the ADC lands, a separate `measurement` task fills meas.v_gen_rms etc.
                         *current_rpm = rpm;
                         meas.rpm = rpm;
-                        let adc_m = cx.shared.adc_meas.lock(|am| *am);
-                        let load_lvl = cx.shared.load_bank.lock(|lb| lb.level());
                         let wire_load = match load_lvl {
                             crate::guv::load_bank::LoadLevel::None => {
                                 shared::models::telemetry::telemetry::LoadLevel::None
@@ -1530,41 +1740,47 @@ mod app {
                             run_mode: run_config.map(|c| c.mode),
                             fault: *last_fault,
                         };
-
-                        if *state != STATE::BOOT {
-                            let mut buf = [0u8; 192];
-                            if let Ok(encoded) =
-                                postcard::to_slice_cobs(&Uplink::Telemetry(frame), &mut buf)
-                            {
-                                for byte in encoded.iter() {
-                                    block!(tx.write(*byte)).ok();
-                                }
-                            }
-
-                            // send a pending calibration report, if one was queued
-                            if let Some(rep) = report {
-                                let mut rbuf = [0u8; 192];
-                                if let Ok(encoded) =
-                                    postcard::to_slice_cobs(&Uplink::Calibration(rep), &mut rbuf)
-                                {
-                                    for byte in encoded.iter() {
-                                        block!(tx.write(*byte)).ok();
-                                    }
-                                    defmt::info!("Calibration report sent");
-                                }
-                            }
-                        }
-
-                        if loop_counter % 100 == 0 {
-                            defmt::info!(
-                                "RPM: {} DUTY: {}% STATE: {}",
-                                rpm as i32,
-                                (motor.demand() * 100.0) as i32,
-                                state.as_str()
-                            );
-                        }
+                        (frame, rpm, motor.demand())
                     },
                 );
+
+            // ── 2. Transmit holding only `tx` (shared with priority-1 tasks
+            // only), so the ~7 ms of UART time no longer blocks the
+            // supervisor. ──
+            if frame.state != STATE::BOOT {
+                cx.shared.tx.lock(|tx| {
+                    let mut buf = [0u8; 192];
+                    if let Ok(encoded) =
+                        postcard::to_slice_cobs(&Uplink::Telemetry(frame), &mut buf)
+                    {
+                        for byte in encoded.iter() {
+                            block!(tx.write(*byte)).ok();
+                        }
+                    }
+
+                    // send a pending calibration report, if one was queued
+                    if let Some(rep) = report {
+                        let mut rbuf = [0u8; 192];
+                        if let Ok(encoded) =
+                            postcard::to_slice_cobs(&Uplink::Calibration(rep), &mut rbuf)
+                        {
+                            for byte in encoded.iter() {
+                                block!(tx.write(*byte)).ok();
+                            }
+                            defmt::info!("Calibration report sent");
+                        }
+                    }
+                });
+            }
+
+            if loop_counter % 100 == 0 {
+                defmt::info!(
+                    "RPM: {} DUTY: {}% STATE: {}",
+                    rpm as i32,
+                    (demand * 100.0) as i32,
+                    frame.state.as_str()
+                );
+            }
             loop_counter = loop_counter.wrapping_add(1);
         }
     }

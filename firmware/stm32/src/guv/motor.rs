@@ -2,10 +2,13 @@ use crate::guv::prime_mover::PrimeMover;
 use cortex_m::prelude::_embedded_hal_PwmPin;
 use stm32h7xx_hal::{device::TIM1, pwm};
 
-/// DC-motor prime mover: inverted-PWM control of the shaft-drive motor.
-/// Inverted: PWM duty=MAX means motor OFF, duty=0 means motor at 100%.
-/// The inversion, TIM1 wiring, and max_duty are implementation details hidden
-/// behind the PrimeMover interface — the control loop sees only demand 0.0–1.0.
+/// DC-motor prime mover: PWM duty proportional to demand.
+/// duty = 0 means motor OFF; duty = max means full command.
+/// PE9 (TIM1_CH1, Arduino D6) → 74HCT125 → 2-pole RC → 3296 trimmer → SI-6 SIG,
+/// so 0% duty is 0 V on SIG. A reset, a crash, a disabled timer or an
+/// unpowered Nucleo all land on stopped.
+/// TIM1 wiring and max_duty are implementation details hidden behind the
+/// PrimeMover interface — the control loop sees only demand 0.0–1.0.
 pub struct MotorController {
     pwm: pwm::Pwm<TIM1, 0, pwm::ComplementaryDisabled>,
     max_duty: u16,
@@ -35,10 +38,10 @@ impl MotorController {
         self.max_duty
     }
 
-    /// Internal: translate a demand fraction to the inverted PWM duty.
+    /// Internal: translate a demand fraction to the PWM duty.
     fn apply_demand(&mut self, fraction: f32) {
-        let inverted = self.max_duty as f32 * (1.0 - fraction);
-        self.pwm.set_duty(inverted as u16);
+        let duty = self.max_duty as f32 * fraction.clamp(0.0, 1.0);
+        self.pwm.set_duty(duty as u16);
     }
 }
 
@@ -47,7 +50,12 @@ impl PrimeMover for MotorController {
         if !self.enabled {
             return;
         }
-        let clamped = demand.clamp(0.0, self.demand_clamp);
+        // A NaN or infinite demand (bad feedforward, corrupt config) means stop.
+        let clamped = if demand.is_finite() {
+            demand.clamp(0.0, self.demand_clamp)
+        } else {
+            0.0
+        };
         self.current_demand = clamped;
         self.apply_demand(clamped);
     }
@@ -68,11 +76,17 @@ impl PrimeMover for MotorController {
 
     fn emergency_off(&mut self) {
         self.current_demand = 0.0;
-        self.pwm.set_duty(self.max_duty); // inverted: max duty = motor off
+        self.pwm.set_duty(0); // 0% duty = 0 V on SIG = motor off
     }
 
     fn set_max_demand(&mut self, clamp: f32) {
-        self.demand_clamp = clamp.clamp(0.0, 1.0);
+        // f32::clamp panics on a NaN bound, so a NaN clamp from the server must
+        // never reach demand_clamp. Treat it as 0 (no drive).
+        self.demand_clamp = if clamp.is_finite() {
+            clamp.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if self.current_demand > self.demand_clamp {
             self.set_demand(self.demand_clamp);
         }

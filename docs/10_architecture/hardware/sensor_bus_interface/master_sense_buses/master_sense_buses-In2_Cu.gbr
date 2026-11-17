@@ -1,12 +1,12 @@
 %TF.GenerationSoftware,KiCad,Pcbnew,10.0.5*%
-%TF.CreationDate,2026-10-16T23:16:54-05:00*%
+%TF.CreationDate,2026-10-17T10:36:46-05:00*%
 %TF.ProjectId,master_sense_buses,6d617374-6572-45f7-9365-6e73655f6275,rev?*%
 %TF.SameCoordinates,Original*%
 %TF.FileFunction,Copper,L3,Inr*%
 %TF.FilePolarity,Positive*%
 %FSLAX46Y46*%
 G04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*
-G04 Created by KiCad (PCBNEW 10.0.5) date 2026-10-16 23:16:54*
+G04 Created by KiCad (PCBNEW 10.0.5) date 2026-10-17 10:36:46*
 %MOMM*%
 %LPD*%
 G01*
@@ -123,7 +123,6 @@ X146600000Y-80494000D03*
 X138920000Y-87000000D03*
 %TO.N,+3.3V*%
 X158684000Y-100660000D03*
-X143554000Y-135803000D03*
 X161018000Y-100382000D03*
 X148055875Y-115721593D03*
 X134776000Y-99322000D03*

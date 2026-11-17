@@ -1,7 +1,7 @@
 /// The interface between the control loop and whatever physically produces
 /// shaft power. The control loop commands *demand* (0.0–1.0 of available
 /// output) and requires an emergency-off; it does NOT know whether that demand
-/// becomes an inverted-PWM duty on a DC motor or a valve position on a turbine.
+/// becomes a PWM duty on a DC motor or a valve position on a turbine.
 ///
 /// This is the seam the Phase 4 turbine swaps into: a `TurbineController`
 /// implementing this trait drops in without touching the PID, feedforward,

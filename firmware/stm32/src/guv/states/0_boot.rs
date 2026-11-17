@@ -45,10 +45,32 @@ pub struct Board {
     pub adc_sync: crate::guv::adc::Sync,
     pub adc_rst: crate::guv::adc::Rst,
     pub adc_drdy: crate::guv::adc::Drdy,
+
+    /// Independent watchdog — created here, started at the end of init once
+    /// the (slow) ADC bring-up is done, fed by the 500 Hz supervisor.
+    pub iwdg: stm32h7xx_hal::independent_watchdog::IndependentWatchdog,
 }
 
 pub fn setup(mut dp: pac::Peripherals) -> Board {
     defmt::info!("BOOT: entering setup");
+
+    // Why did we (re)start? A watchdog reset means the firmware hung or
+    // crashed while running — worth knowing before anything else.
+    // SAFETY: read RCC_RSR, then set RMVF to clear the flags for next time.
+    unsafe {
+        let rcc = &*pac::RCC::ptr();
+        let rsr = rcc.rsr.read();
+        if rsr.iwdg1rstf().bit_is_set() {
+            defmt::error!("BOOT: last reset was the WATCHDOG (firmware hung or crashed)");
+        } else if rsr.sftrstf().bit_is_set() {
+            defmt::info!("BOOT: last reset: software (probe/flash)");
+        } else if rsr.borrstf().bit_is_set() || rsr.porrstf().bit_is_set() {
+            defmt::info!("BOOT: last reset: power-on / brown-out");
+        } else if rsr.pinrstf().bit_is_set() {
+            defmt::info!("BOOT: last reset: NRST pin");
+        }
+        rcc.rsr.modify(|_, w| w.rmvf().set_bit());
+    }
 
     // 1. Power & Clocks
     defmt::info!("BOOT: constraining PWR");
@@ -113,7 +135,7 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     let mut ld2 = gpioe.pe1.into_push_pull_output();
     let mut ld3 = gpiob.pb14.into_push_pull_output();
 
-    // PWM Setup (Pin D7[PWM])
+    // PWM setup: PE9 = TIM1_CH1 = Arduino D6
     let pwm_pin = gpioe.pe9.into_alternate::<1>();
     // Consumes TIM1 token from ccdr
     let mut motor_pwm = dp
@@ -121,8 +143,10 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
         .pwm(pwm_pin, 20.kHz(), ccdr.peripheral.TIM1, &ccdr.clocks);
 
     motor_pwm.enable();
-    motor_pwm.set_duty(motor_pwm.get_max_duty());
-    defmt::info!("BOOT: PWM configured");
+    // 0% = stopped (PE9 → 74HCT125 → RC → 3296 → SI-6 SIG). motor.rs uses the
+    // same convention: duty = demand × max, off = 0.
+    motor_pwm.set_duty(0);
+    defmt::info!("BOOT: PWM configured (0% duty)");
     //estop
     let estop = gpioe.pe6.into_pull_up_input();
     //relays
@@ -168,6 +192,8 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
     }
     // PD5 → EXTI line 5 → EXTI9_5; the DRDY ISR in main binds EXTI9_5.
     defmt::info!("BOOT: DRDY EXTI configured");
+    let iwdg = stm32h7xx_hal::independent_watchdog::IndependentWatchdog::new(dp.IWDG);
+
     let adc_spi = dp.SPI1.spi(
         (sck, miso, mosi),
         stm32h7xx_hal::spi::MODE_1,
@@ -226,5 +252,6 @@ pub fn setup(mut dp: pac::Peripherals) -> Board {
         adc_sync,
         adc_rst,
         adc_drdy,
+        iwdg,
     }
 }

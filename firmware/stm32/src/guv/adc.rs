@@ -584,7 +584,7 @@ impl Ads131Pair {
             }
             Ok(id) if id >> 8 == 0x05 => {
                 defmt::error!(
-                    "ADS#{=u8} returned 0x{=u16:x} (the STATUS word, not ID) — the read command never arrived: check MOSI (PA7) to DIN",
+                    "ADS#{=u8} returned 0x{=u16:x} (the STATUS word, not ID) — the read command never arrived: check MOSI (PB5) to DIN",
                     chip.n(),
                     id
                 );
@@ -633,7 +633,9 @@ impl Ads131Pair {
     }
 
     /// Read one coherent frame from BOTH chips. Called from the DRDY ISR.
-    ///   Chip1 → [ref, v_a, v_b, v_c]   Chip2 → [v_dc, i_dc, spare, spare]
+    ///   Chip 1 → [ref, v_a, v_b, v_c]
+    ///   Chip 2 → [i_dc, v_dc, GND, GND]  (rev 11: AIN0 = AMC1302 U8 on the R40
+    ///            shunt, AIN1 = AMC1311B U14 on the DC divider)
     /// Returns None while offline or if a transfer errors.
     pub fn read_frame(&mut self) -> Option<RawFrame> {
         if !self.online {
@@ -646,8 +648,8 @@ impl Ads131Pair {
             v_a: c1[1],
             v_b: c1[2],
             v_c: c1[3],
-            v_dc: c2[0],
-            i_dc: c2[1],
+            v_dc: c2[1],
+            i_dc: c2[0],
         })
     }
 
@@ -691,12 +693,38 @@ impl Ads131Pair {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// (measurement layer follows — appended below)
+// MEASUREMENT LAYER (no hardware dependencies below this line)
+//
+// One 4 kSPS sample stream feeds three windows. Each window is reset only by
+// the task that consumes it, so nobody throws away data another task needs:
+//
+//   AC window   ref + A/B/C   WINDOW_SAMPLES = 100 ms, about 6 cycles at 60 Hz.
+//                             Closed by the DRDY ISR; finalized once by the
+//                             100 Hz control task (sqrt/atan2 happen there).
+//   CONTROL DC  v_dc, i_dc    drained by state_manager every 10 ms.
+//   FAST DC     v_dc, i_dc    drained by safety_supervisor every 2 ms.
+//
+// AC math runs on (sample − bias), where bias is the previous window's mean
+// (the ~0.6 V front-end offset). RMS is therefore the AC component only, and
+// the zero-crossing detector sees a signal centred on zero.
+//
+// Zero crossings are rising edges with hysteresis (the signal must dip below
+// −HYST before the next rising edge counts) and linear interpolation between
+// samples, so frequency and phase resolve to a fraction of a sample (~0.1° at
+// 60 Hz) instead of the 5.4° a whole sample would give.
+//
+// Phase: at each reference rising crossing, every motor phase's most recent
+// rising crossing gives its angle against the reference. POSITIVE = the phase
+// LEADS the reference (crosses earlier). Angles are vector-averaged over the
+// window, so there are no ±π wrap artefacts.
+//
+// A phase with no valid signal reports PHASE_INVALID_RAD (π, i.e. 180°), never
+// 0 — "no data" must never look like "in phase".
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Which motor phase the PLL aligns the reference to. Set from the terminal via
-/// Command::SetAlignPhase; defaults to A. Mirror this enum in the shared crate
-/// so the wire Command can carry it.
+/// Command::SetAlignPhase; defaults to A. Mirrored by the shared crate's
+/// AlignPhase on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
 pub enum AlignPhase {
     A,
@@ -710,318 +738,417 @@ impl Default for AlignPhase {
     }
 }
 
-/// One coherent sample set. Chip1 = reference + 3 motor phase voltages (sampled
-/// the same instant, so phase differences are meaningful). Chip2 = rectifier DC.
+/// One coherent sample set. Chip 1 = reference + 3 motor phase voltages,
+/// sampled at the same instant, so phase differences are meaningful.
+/// Chip 2 = rectifier DC bus.
 #[derive(Clone, Copy, Default)]
 pub struct RawFrame {
-    pub v_ref: i32, // reference phase (chip1 ch0)
-    pub v_a: i32,   // motor phase A   (chip1 ch1)
-    pub v_b: i32,   // motor phase B   (chip1 ch2)
-    pub v_c: i32,   // motor phase C   (chip1 ch3)
-    pub v_dc: i32,  // rectifier DC voltage (chip2 ch0)
-    pub i_dc: i32,  // rectifier DC current (chip2 ch1)
-                    // chip2 ch2/ch3 spare — add fields here when you wire them.
+    pub v_ref: i32, // reference phase       (chip 1 ch0, AMC1311 U7)
+    pub v_a: i32,   // motor phase A          (chip 1 ch1, U6)
+    pub v_b: i32,   // motor phase B          (chip 1 ch2, U5)
+    pub v_c: i32,   // motor phase C          (chip 1 ch3, U4)
+    pub v_dc: i32,  // rectifier DC voltage   (chip 2 ch1, U14)
+    pub i_dc: i32,  // rectifier DC current   (chip 2 ch0, AMC1302 U8 across R40)
 }
 
-/// Per-channel zero-crossing tracker. Records the fractional sample index of the
-/// most recent RISING zero-crossing within the current window, for phase math.
+// ── window + detector tuning ──
+
+/// AC window length in samples: 100 ms (about 6 cycles at 60 Hz).
+pub const WINDOW_SAMPLES: u32 = ADC_SAMPLE_RATE / 10;
+/// Zero-crossing hysteresis at the ADS input (V). About 2.5 V on a motor
+/// phase and 1.7 V on the mains reference — well above the noise floor.
+const CROSS_HYST_VOLTS: f32 = 0.005;
+/// The same hysteresis in ADS counts (integer hot path).
+const CROSS_HYST_COUNTS: i32 = (CROSS_HYST_VOLTS * ADC_COUNTS / ADC_FS_VOLTS) as i32;
+/// Crossings only pair into a period inside this band (Hz).
+const F_MIN_HZ: f64 = 40.0;
+const F_MAX_HZ: f64 = 80.0;
+/// Reference cycles recorded per window (100 ms at 80 Hz is 8; headroom).
+const MAX_CYCLES: usize = 12;
+/// Reported for a phase with no valid crossings this window.
+pub const PHASE_INVALID_RAD: f32 = core::f32::consts::PI;
+
+// ── scaling (rev 11 front end) ──
+
+const ADC_FS_VOLTS: f32 = 1.2;
+const ADC_COUNTS: f32 = 8_388_608.0; // 2^23
+
+/// Each isolator output reaches its ADS131M04 input through 1 kΩ + 1 kΩ
+/// (R1–R13). Against the ADS's ~300 kΩ differential input impedance (gain 1,
+/// fMOD 4.096 MHz) that divider loses ~0.66%; this puts it back. Calibration
+/// against a known input trims whatever remains.
+const FILTER_LOADING: f32 = (300_000.0 + 2_000.0) / 300_000.0;
+
+// RATIO = real-world units per isolator-output volt. Voltage channels
+// (AMC1311B, gain 1): (Rtop + Rbot) / Rbot, Rtop = 3 × 330 kΩ = 990 kΩ.
+const REF_V_RATIO: f32 = 337.7; // R41 2.94 kΩ (US). EU part 1.54 kΩ → 643.9
+const PHASE_V_RATIO: f32 = 496.0; // R36/R37/R39 2.00 kΩ
+const DC_V_RATIO: f32 = 337.7; // R45 2.94 kΩ, no bias → full scale ≈ 405 V
+
+/// R40 sense resistor (Ω). Rev 11 fits 0.1 Ω (L4CL1206LR100). With the
+/// AMC1302's gain of 41 the ADS clips at 1.2 V / 41 / 0.1 Ω ≈ 0.29 A — right
+/// where both load steps sit at a 310–325 V bus. A 0.05 Ω part on the same
+/// footprint doubles the range; change this constant with it.
+pub const SHUNT_OHMS: f32 = 0.1;
+const AMC1302_GAIN: f32 = 41.0;
+const DC_I_RATIO: f32 = 1.0 / (SHUNT_OHMS * AMC1302_GAIN);
+/// Current at the ADS clip (A). Readings at or above this mean "at least this".
+pub const I_DC_FULL_SCALE: f32 = ADC_FS_VOLTS * FILTER_LOADING * DC_I_RATIO;
+
+/// ADS counts → isolator output volts (filter loading removed).
+#[inline]
+fn counts_to_amc_volts(raw: f64, gain: f32) -> f32 {
+    (raw as f32) * (ADC_FS_VOLTS / ADC_COUNTS) / gain * FILTER_LOADING
+}
+
+/// Rising zero-crossing detector with hysteresis + linear interpolation.
+/// Integer per sample; floating point only on an actual crossing.
 #[derive(Clone, Copy, Default)]
-struct CrossTracker {
-    last_sign: i8,       // sign of previous sample (+1 / -1)
-    last_cross_idx: f32, // sample index of most recent rising crossing this window
-    have_cross: bool,    // saw at least one crossing this window
-    crossings: u32,      // rising crossings this window (for frequency)
+struct Edge {
+    armed: bool, // dipped below −hyst since the last rising crossing
+    prev: i32,   // previous (sample − bias), counts
+    have_prev: bool,
+    last_t: f64, // absolute time (samples) of the latest rising crossing
+    have_last: bool,
 }
 
-impl CrossTracker {
+impl Edge {
+    /// `x` = sample − bias (counts), `t` = sample index of `x`.
+    /// Returns the interpolated crossing time on a rising crossing.
     #[inline]
-    fn add(&mut self, sample: f64, bias: f64, idx: u32) {
-        // Compare against the channel's DC bias (the ~0.6 V AC offset), not 0, so a
-        // biased-up AC still zero-crosses. `bias` is the previous window's mean.
-        let sign: i8 = if (sample - bias) >= 0.0 { 1 } else { -1 };
-        if self.last_sign < 0 && sign > 0 {
-            // rising zero-crossing between (idx-1) and idx. Linear-interpolate the
-            // sub-sample crossing point isn't tracked here (we use the integer idx);
-            // for finer phase, interpolate using prev/cur magnitudes.
-            self.last_cross_idx = idx as f32;
-            self.have_cross = true;
-            self.crossings += 1;
+    fn add(&mut self, x: i32, t: u32, hyst: i32) -> Option<f64> {
+        let mut out = None;
+        if x < -hyst {
+            self.armed = true;
         }
-        self.last_sign = sign;
-    }
-    #[inline]
-    fn reset_window(&mut self) {
-        // keep last_sign for continuity across windows; clear per-window state.
-        self.have_cross = false;
-        self.crossings = 0;
+        if self.armed && self.have_prev && self.prev < 0 && x >= 0 {
+            // The zero lies between t-1 (prev < 0) and t (x >= 0).
+            let frac = (-self.prev) as f64 / (x - self.prev) as f64;
+            let tc = t as f64 - 1.0 + frac;
+            self.armed = false;
+            self.last_t = tc;
+            self.have_last = true;
+            out = Some(tc);
+        }
+        self.prev = x;
+        self.have_prev = true;
+        out
     }
 }
 
-/// Running accumulators between finalize calls. Tracks RMS (sum-of-squares) for
-/// magnitudes AND zero-crossings for phase alignment. Kept lean — no divide/sqrt
-/// in the ISR; those happen in finalize.
+/// Everything one AC window collected. Produced by the ISR, consumed by
+/// `finalize_window` in the 100 Hz task. Index 0 = ref, 1..=3 = A, B, C.
+#[derive(Clone, Copy, Default)]
+pub struct WindowStats {
+    n: u32,
+    sum: [i64; 4],  // Σ(x − bias), counts — exact
+    sum2: [i64; 4], // Σ(x − bias)², counts² — ≤ 2^55 over a window, fits
+    cross_n: [u32; 4],
+    cross_first: [f64; 4],
+    cross_last: [f64; 4],
+    // Running (Σx, Σx², n) captured at each channel's first and latest
+    // crossing, so RMS can be taken over whole cycles of that channel.
+    snap_first: [(i64, i64, u32); 4],
+    snap_last: [(i64, i64, u32); 4],
+    phase: [[f32; MAX_CYCLES]; 3], // per-cycle angle of A/B/C vs ref (rad)
+    phase_n: [u8; 3],
+}
+
+/// DC bus means over one drained window.
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct DcScalars {
+    pub v_dc: f32,
+    pub i_dc: f32, // load-feedforward / load-rejection source
+}
+
+/// Running state fed by the DRDY ISR. The per-sample path is integer only
+/// (exact, and cheap even without the M7's double-precision FPU enabled);
+/// floating point runs once per zero crossing.
 #[derive(Clone, Copy, Default)]
 pub struct Accumulator {
-    // sum of squares for RMS magnitudes
-    pub sq_ref: f64,
-    pub sq_a: f64,
-    pub sq_b: f64,
-    pub sq_c: f64,
-    // AC running sums → per-window mean, to remove the ~0.6 V bias from RMS
-    pub sum_ref: f64,
-    pub sum_a: f64,
-    pub sum_b: f64,
-    pub sum_c: f64,
-    // DC-bus running sums (mean, not RMS)
-    pub sum_v_dc: f64,
-    pub sum_i_dc: f64,
-    // zero-crossing trackers (phase alignment)
-    x_ref: CrossTracker,
-    x_a: CrossTracker,
-    x_b: CrossTracker,
-    x_c: CrossTracker,
-    // carried AC means (previous window) used as this window's zero-crossing bias
-    bias_ref: f64,
-    bias_a: f64,
-    bias_b: f64,
-    bias_c: f64,
-    // sample count this window
-    pub n: u32,
+    t: u32,          // sample clock (wraps after ~12 days; harmless)
+    bias: [i32; 4],  // previous window's mean per AC channel (counts)
+    have_bias: bool, // false until the first window completes
+    edge: [Edge; 4],
+    win: WindowStats,          // window being built
+    done: Option<WindowStats>, // last completed window, not yet taken
+    ctl_v: i64,
+    ctl_i: i64,
+    ctl_n: u32,
+    fast_v: i64,
+    fast_i: i64,
+    fast_n: u32,
 }
 
 impl Accumulator {
-    #[inline]
-    pub fn reset(&mut self) {
-        // Carry each AC channel's mean forward as next window's zero-crossing bias.
-        // First window (n==0) leaves bias at 0.0 → that one window reports no
-        // crossings (freq/phase = 0) until seeded; RMS is already correct from
-        // window 1 because ac_rms_counts subtracts the window's own mean.
-        if self.n > 0 {
-            let n = self.n as f64;
-            self.bias_ref = self.sum_ref / n;
-            self.bias_a = self.sum_a / n;
-            self.bias_b = self.sum_b / n;
-            self.bias_c = self.sum_c / n;
-        }
-        self.sq_ref = 0.0;
-        self.sq_a = 0.0;
-        self.sq_b = 0.0;
-        self.sq_c = 0.0;
-        self.sum_ref = 0.0;
-        self.sum_a = 0.0;
-        self.sum_b = 0.0;
-        self.sum_c = 0.0;
-        self.sum_v_dc = 0.0;
-        self.sum_i_dc = 0.0;
-        self.x_ref.reset_window();
-        self.x_a.reset_window();
-        self.x_b.reset_window();
-        self.x_c.reset_window();
-        self.n = 0;
-    }
-
-    /// Add one coherent sample (called from the DRDY ISR — keep LEAN).
+    /// Add one coherent sample. Called from the DRDY ISR.
     #[inline]
     pub fn add(&mut self, f: &RawFrame) {
-        let vr = f.v_ref as f64;
-        let va = f.v_a as f64;
-        let vb = f.v_b as f64;
-        let vc = f.v_c as f64;
+        let raw = [f.v_ref, f.v_a, f.v_b, f.v_c];
+        let t = self.t;
 
-        self.sq_ref += vr * vr;
-        self.sq_a += va * va;
-        self.sq_b += vb * vb;
-        self.sq_c += vc * vc;
+        let mut ref_cross: Option<(f64, f64)> = None; // (crossing time, period)
+        for k in 0..4 {
+            let x = raw[k].wrapping_sub(self.bias[k]);
+            let xl = x as i64;
+            self.win.sum[k] += xl;
+            self.win.sum2[k] += xl * xl;
+            let snap = (self.win.sum[k], self.win.sum2[k], self.win.n + 1);
 
-        self.sum_ref += vr;
-        self.sum_a += va;
-        self.sum_b += vb;
-        self.sum_c += vc;
+            if self.have_bias {
+                let prev_last = self.edge[k].last_t;
+                let had_last = self.edge[k].have_last;
+                if let Some(tc) = self.edge[k].add(x, t, CROSS_HYST_COUNTS) {
+                    if self.win.cross_n[k] == 0 {
+                        self.win.cross_first[k] = tc;
+                        self.win.snap_first[k] = snap;
+                    }
+                    self.win.cross_last[k] = tc;
+                    self.win.snap_last[k] = snap;
+                    self.win.cross_n[k] += 1;
+                    if k == 0 && had_last {
+                        let period = tc - prev_last;
+                        let min_period = ADC_SAMPLE_RATE as f64 / F_MAX_HZ;
+                        let max_period = ADC_SAMPLE_RATE as f64 / F_MIN_HZ;
+                        if period >= min_period && period <= max_period {
+                            ref_cross = Some((tc, period));
+                        }
+                    }
+                }
+            }
+        }
 
-        self.sum_v_dc += f.v_dc as f64;
-        self.sum_i_dc += f.i_dc as f64;
+        // Angle of each motor phase against this reference crossing.
+        if let Some((tc, period)) = ref_cross {
+            use core::f64::consts::PI;
+            for p in 0..3 {
+                let e = &self.edge[p + 1];
+                if !e.have_last {
+                    continue;
+                }
+                // d > 0: the phase crossed d samples BEFORE the reference → leads.
+                let d = tc - e.last_t;
+                if d.abs() >= 1.5 * period {
+                    continue; // stale — that phase has stopped crossing
+                }
+                let mut th = 2.0 * PI * d / period;
+                while th > PI {
+                    th -= 2.0 * PI;
+                }
+                while th <= -PI {
+                    th += 2.0 * PI;
+                }
+                let n = self.win.phase_n[p] as usize;
+                if n < MAX_CYCLES {
+                    self.win.phase[p][n] = th as f32;
+                    self.win.phase_n[p] += 1;
+                }
+            }
+        }
 
-        let idx = self.n;
-        self.x_ref.add(vr, self.bias_ref, idx);
-        self.x_a.add(va, self.bias_a, idx);
-        self.x_b.add(vb, self.bias_b, idx);
-        self.x_c.add(vc, self.bias_c, idx);
+        let vdc = f.v_dc as i64;
+        let idc = f.i_dc as i64;
+        self.ctl_v += vdc;
+        self.ctl_i += idc;
+        self.ctl_n += 1;
+        self.fast_v += vdc;
+        self.fast_i += idc;
+        self.fast_n += 1;
 
-        self.n = self.n.wrapping_add(1);
+        self.win.n += 1;
+        self.t = self.t.wrapping_add(1);
+
+        if self.win.n >= WINDOW_SAMPLES {
+            self.close_window();
+        }
+    }
+
+    /// Publish the window, re-centre each channel on its new mean, start fresh.
+    fn close_window(&mut self) {
+        let n = self.win.n as i64;
+        for k in 0..4 {
+            let shift = (self.win.sum[k] / n) as i32; // mean of (x − old bias)
+            self.bias[k] = self.bias[k].wrapping_add(shift);
+            // Keep the detector's previous sample on the same reference.
+            self.edge[k].prev = self.edge[k].prev.wrapping_sub(shift);
+        }
+        if !self.have_bias {
+            // The first window only seeded the bias; its crossings were not
+            // measured, so don't publish it.
+            self.have_bias = true;
+        } else {
+            self.done = Some(self.win);
+        }
+        self.win = WindowStats::default();
+    }
+
+    /// Take the latest completed AC window (once). Called by the 100 Hz task.
+    pub fn take_window(&mut self) -> Option<WindowStats> {
+        self.done.take()
+    }
+
+    /// DC means since the last call. Called by the 100 Hz task.
+    pub fn take_control_dc(&mut self, gain: f32) -> Option<DcScalars> {
+        let r = dc_mean(self.ctl_v, self.ctl_i, self.ctl_n, gain);
+        self.ctl_v = 0;
+        self.ctl_i = 0;
+        self.ctl_n = 0;
+        r
+    }
+
+    /// DC means since the last call. Called by the 500 Hz supervisor.
+    pub fn take_fast_dc(&mut self, gain: f32) -> Option<DcScalars> {
+        let r = dc_mean(self.fast_v, self.fast_i, self.fast_n, gain);
+        self.fast_v = 0;
+        self.fast_i = 0;
+        self.fast_n = 0;
+        r
     }
 }
 
-/// Finalized electrical + alignment scalars. Shipped in telemetry and used by
-/// the control loop (PLL_LOCK reads theta_err_rad; the governor reads i_dc for
-/// feedforward and v_dc for protection).
-#[derive(Clone, Copy, Default, defmt::Format)]
+fn dc_mean(sum_v: i64, sum_i: i64, n: u32, gain: f32) -> Option<DcScalars> {
+    if n == 0 {
+        return None; // no samples (ADC offline or not converting)
+    }
+    let n = n as f64;
+    Some(DcScalars {
+        v_dc: counts_to_amc_volts(sum_v as f64 / n, gain) * DC_V_RATIO,
+        i_dc: counts_to_amc_volts(sum_i as f64 / n, gain) * DC_I_RATIO,
+    })
+}
+
+/// Finalized electrical + alignment values. Shipped in telemetry and used by
+/// the control loop (PLL_LOCK reads phase_err_selected → theta_err_rad; the
+/// governor and supervisor read v_dc / i_dc).
+#[derive(Clone, Copy, defmt::Format)]
 pub struct Measurements {
-    // magnitudes (RMS, SI volts/amps after scaling)
+    // magnitudes (RMS, real volts / amps)
     pub v_ref_rms: f32,
     pub v_a_rms: f32,
     pub v_b_rms: f32,
     pub v_c_rms: f32,
     pub v_dc: f32,
     pub i_dc: f32,
-    pub freq_hz: f32, // line frequency from the reference channel
+    /// Reference (mains) frequency, Hz. 0 = no valid reference this window.
+    pub freq_hz: f32,
 
-    // phase error (radians, wrapped ±π) of each motor phase RELATIVE to reference.
-    // Positive = phase leads reference. PLL drives the SELECTED one to zero.
+    /// Each motor phase vs the reference, radians in (−π, π]; positive = the
+    /// phase leads. PHASE_INVALID_RAD when that phase had no valid crossings.
     pub phase_err_a: f32,
     pub phase_err_b: f32,
     pub phase_err_c: f32,
-    /// The error for the currently-selected align target — this is theta_err_rad.
+    pub phase_valid: [bool; 3],
+    /// Frequency of each motor phase (generator electrical frequency), Hz.
+    pub phase_freq_hz: [f32; 3],
+
+    /// The selected align target's values (see `select`).
     pub phase_err_selected: f32,
+    pub gen_freq_hz: f32,
+    pub selected_valid: bool,
 }
 
-// ── scaling helpers (fill ratios once the front-end is built) ──
-const ADC_FS_VOLTS: f32 = 1.2;
-const ADC_COUNTS: f32 = 8_388_608.0; // 2^23
-
-// Front-end scaling. RATIO = real-world units per pin-volt (ADS differential volt).
-// Voltage channels (AMC1311, gain 1): RATIO = (Rtop + Rbot) / Rbot  [inverse divider].
-//   Rtop = 3×330k = 990k on every voltage channel. Trim each against a known
-//   applied input before trusting absolute magnitudes.
-const REF_V_RATIO: f32 = 337.7; // reference = 120 V mains, Rbot 2.94k → (990k+2.94k)/2.94k
-                                //   230 V jumper option (Rbot 1.54k): use 643.9
-const PHASE_V_RATIO: f32 = 496.0; // motor phases, Rbot 2.00k → (990k+2.00k)/2.00k
-const DC_V_RATIO: f32 = 337.7; // DC bus, Rbot 2.94k → (990k+2.94k)/2.94k
-                               // DC current: shunt 0.1Ω × AMC1302 gain 41 = 4.1 V/A → RATIO = 1/(0.1×41).
-const DC_I_RATIO: f32 = 0.243_90; // amps per pin-volt (0.1Ω shunt, AMC1302 ×41)
-
-#[inline]
-fn counts_to_pin_volts(raw: f64, gain: f32) -> f32 {
-    (raw as f32) * (ADC_FS_VOLTS / ADC_COUNTS) / gain
-}
-
-/// True AC RMS in counts: sqrt(mean(x²) − mean(x)²). Subtracting the mean removes
-/// the ~0.6 V DC bias on the AC channels so RMS reflects the AC component only.
-#[inline]
-fn ac_rms_counts(sq: f64, sum: f64, n: f64) -> f64 {
-    let mean = sum / n;
-    let var = sq / n - mean * mean;
-    libm::sqrt(if var > 0.0 { var } else { 0.0 })
-}
-
-/// Wrap a phase difference (radians) into ±π.
-#[inline]
-fn wrap_pi(mut x: f32) -> f32 {
-    use core::f32::consts::PI;
-    while x > PI {
-        x -= 2.0 * PI;
+impl Default for Measurements {
+    fn default() -> Self {
+        Self {
+            v_ref_rms: 0.0,
+            v_a_rms: 0.0,
+            v_b_rms: 0.0,
+            v_c_rms: 0.0,
+            v_dc: 0.0,
+            i_dc: 0.0,
+            freq_hz: 0.0,
+            phase_err_a: PHASE_INVALID_RAD,
+            phase_err_b: PHASE_INVALID_RAD,
+            phase_err_c: PHASE_INVALID_RAD,
+            phase_valid: [false; 3],
+            phase_freq_hz: [0.0; 3],
+            phase_err_selected: PHASE_INVALID_RAD,
+            gen_freq_hz: 0.0,
+            selected_valid: false,
+        }
     }
-    while x < -PI {
-        x += 2.0 * PI;
-    }
-    x
 }
 
-/// Phase error of a target channel vs the reference, in radians. Uses the
-/// difference in rising-crossing sample index over one window, scaled to the
-/// samples-per-cycle. Returns 0 if either lacks a crossing this window.
-#[inline]
-fn phase_err(target: &CrossTracker, reference: &CrossTracker) -> f32 {
-    use core::f32::consts::PI;
-    if !target.have_cross || !reference.have_cross {
+impl Measurements {
+    /// Point the "selected" fields at the align target. Cheap; call every tick
+    /// so a SetAlignPhase takes effect immediately, not at the next window.
+    pub fn select(&mut self, align: AlignPhase) {
+        let i = match align {
+            AlignPhase::A => 0,
+            AlignPhase::B => 1,
+            AlignPhase::C => 2,
+        };
+        self.phase_err_selected = [self.phase_err_a, self.phase_err_b, self.phase_err_c][i];
+        self.gen_freq_hz = self.phase_freq_hz[i];
+        self.selected_valid = self.phase_valid[i];
+    }
+
+    /// Fold in fresh DC means.
+    pub fn apply_dc(&mut self, dc: &DcScalars) {
+        self.v_dc = dc.v_dc;
+        self.i_dc = dc.i_dc;
+    }
+}
+
+/// Frequency from the first and last interpolated crossings of a window.
+fn window_freq(w: &WindowStats, k: usize) -> f32 {
+    let n = w.cross_n[k];
+    let span = w.cross_last[k] - w.cross_first[k];
+    if n < 2 || span <= 0.0 {
         return 0.0;
     }
-    let samples_per_cycle = SAMPLES_PER_CYCLE as f32;
-    let d_samples = target.last_cross_idx - reference.last_cross_idx;
-    let err = (d_samples / samples_per_cycle) * 2.0 * PI;
-    wrap_pi(err)
-}
-
-/// FULL finalize (100 Hz control tick): magnitudes + all phase errors + the
-/// selected error. `align` picks which phase's error becomes phase_err_selected
-/// (→ theta_err_rad). Caller resets the accumulator after.
-pub fn finalize_full(acc: &Accumulator, gain: f32, align: AlignPhase) -> Measurements {
-    if acc.n == 0 {
-        return Measurements::default();
-    }
-    let n = acc.n as f64;
-
-    let v_ref_rms =
-        counts_to_pin_volts(ac_rms_counts(acc.sq_ref, acc.sum_ref, n), gain) * REF_V_RATIO;
-    let v_a_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_a, acc.sum_a, n), gain) * PHASE_V_RATIO;
-    let v_b_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_b, acc.sum_b, n), gain) * PHASE_V_RATIO;
-    let v_c_rms = counts_to_pin_volts(ac_rms_counts(acc.sq_c, acc.sum_c, n), gain) * PHASE_V_RATIO;
-
-    let v_dc = counts_to_pin_volts(acc.sum_v_dc / n, gain) * DC_V_RATIO;
-    let i_dc = counts_to_pin_volts(acc.sum_i_dc / n, gain) * DC_I_RATIO;
-
-    // frequency from the reference channel's crossings over the window
-    let window_s = n / (ADC_SAMPLE_RATE as f64);
-    let freq_hz = if window_s > 0.0 {
-        (acc.x_ref.crossings as f64 / window_s) as f32
-    } else {
+    let f = (n - 1) as f64 * ADC_SAMPLE_RATE as f64 / span;
+    if f < F_MIN_HZ || f > F_MAX_HZ {
         0.0
-    };
-
-    // phase errors of each motor phase vs the reference
-    let phase_err_a = phase_err(&acc.x_a, &acc.x_ref);
-    let phase_err_b = phase_err(&acc.x_b, &acc.x_ref);
-    let phase_err_c = phase_err(&acc.x_c, &acc.x_ref);
-    let phase_err_selected = match align {
-        AlignPhase::A => phase_err_a,
-        AlignPhase::B => phase_err_b,
-        AlignPhase::C => phase_err_c,
-    };
-
-    Measurements {
-        v_ref_rms,
-        v_a_rms,
-        v_b_rms,
-        v_c_rms,
-        v_dc,
-        i_dc,
-        freq_hz,
-        phase_err_a,
-        phase_err_b,
-        phase_err_c,
-        phase_err_selected,
-    }
-}
-
-/// FAST protection subset (500 Hz, with the overspeed supervisor): DC bus V/I
-/// (over-volt/over-current + the feedforward source) + line frequency. Does NOT
-/// reset the accumulator (the 100 Hz finalize owns the reset).
-#[derive(Clone, Copy, Default, defmt::Format)]
-pub struct ProtectionScalars {
-    pub v_dc: f32,
-    pub i_dc: f32, // ← load-feedforward source: rising i_dc = load increasing
-    pub freq_hz: f32,
-}
-
-pub fn finalize_protection(acc: &Accumulator, gain: f32) -> ProtectionScalars {
-    if acc.n == 0 {
-        return ProtectionScalars::default();
-    }
-    let n = acc.n as f64;
-    let v_dc = counts_to_pin_volts(acc.sum_v_dc / n, gain) * DC_V_RATIO;
-    let i_dc = counts_to_pin_volts(acc.sum_i_dc / n, gain) * DC_I_RATIO;
-    let window_s = n / (ADC_SAMPLE_RATE as f64);
-    let freq_hz = if window_s > 0.0 {
-        (acc.x_ref.crossings as f64 / window_s) as f32
     } else {
-        0.0
-    };
-    ProtectionScalars {
-        v_dc,
-        i_dc,
-        freq_hz,
+        f as f32
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// read_frame — update the channel mapping in Ads131Pair::read_frame to:
-//
-//   pub fn read_frame(&mut self) -> RawFrame {
-//       let c1 = self.read_chip(Chip::One); // [ref, v_a, v_b, v_c]
-//       let c2 = self.read_chip(Chip::Two); // [v_dc, i_dc, spare, spare]
-//       RawFrame {
-//           v_ref: c1[0], v_a: c1[1], v_b: c1[2], v_c: c1[3],
-//           v_dc:  c2[0], i_dc: c2[1],
-//       }
-//   }
-//
-// ═════════════════════════════════════════════════════════════════════════════
+/// Fold a completed AC window into `m` (magnitudes, frequencies, phases).
+/// Leaves v_dc / i_dc alone (those come from `apply_dc`).
+pub fn finalize_window(w: &WindowStats, gain: f32, m: &mut Measurements) {
+    if w.n == 0 {
+        return;
+    }
+    // RMS over whole cycles of each channel (first → latest crossing), so an
+    // off-nominal frequency doesn't leave a partial cycle in the average.
+    // Channels with fewer than two crossings fall back to the whole window.
+    let rms = |k: usize| -> f64 {
+        let (s0, q0, n0) = w.snap_first[k];
+        let (s1, q1, n1) = w.snap_last[k];
+        let (sum, sum2, cnt) = if w.cross_n[k] >= 2 && n1 > n0 {
+            (s1 - s0, q1 - q0, (n1 - n0) as f64)
+        } else {
+            (w.sum[k], w.sum2[k], w.n as f64)
+        };
+        let mean = sum as f64 / cnt;
+        let var = sum2 as f64 / cnt - mean * mean;
+        libm::sqrt(if var > 0.0 { var } else { 0.0 })
+    };
+    m.v_ref_rms = counts_to_amc_volts(rms(0), gain) * REF_V_RATIO;
+    m.v_a_rms = counts_to_amc_volts(rms(1), gain) * PHASE_V_RATIO;
+    m.v_b_rms = counts_to_amc_volts(rms(2), gain) * PHASE_V_RATIO;
+    m.v_c_rms = counts_to_amc_volts(rms(3), gain) * PHASE_V_RATIO;
+
+    m.freq_hz = window_freq(w, 0);
+    let mut err = [PHASE_INVALID_RAD; 3];
+    for p in 0..3 {
+        m.phase_freq_hz[p] = window_freq(w, p + 1);
+        let cnt = w.phase_n[p] as usize;
+        if cnt == 0 {
+            m.phase_valid[p] = false;
+            continue;
+        }
+        let (mut s, mut c) = (0.0f32, 0.0f32);
+        for th in &w.phase[p][..cnt] {
+            s += libm::sinf(*th);
+            c += libm::cosf(*th);
+        }
+        err[p] = libm::atan2f(s, c);
+        m.phase_valid[p] = true;
+    }
+    m.phase_err_a = err[0];
+    m.phase_err_b = err[1];
+    m.phase_err_c = err[2];
+}
